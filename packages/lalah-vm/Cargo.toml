@@ -1,0 +1,28 @@
+[package]
+name = "lalah-vm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+
+# Windows-only: WASAPI exclusive capture + IVSHMEM driver mapping. The `windows`
+# crate links the import libs (ole32, mmdevapi, setupapi, kernel32) via raw-dylib,
+# so no build.rs is needed. Build/check for x86_64 only (the IVSHMEM ioctl struct
+# layout is 64-bit specific).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+] }

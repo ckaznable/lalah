@@ -1,0 +1,16 @@
+[package]
+name = "lalah-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+
+# Linux-only: PipeWire output + the IVSHMEM memory-backend-file mmap.
+# System build deps: libpipewire-0.3-dev, libspa-0.2-dev, clang/libclang-dev,
+# pkg-config (libspa-sys / pipewire-sys run bindgen at build time). Set
+# LIBCLANG_PATH if libclang is not auto-discovered.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10.0"
+memmap2 = "0.9.10"
+libc = "0.2"
