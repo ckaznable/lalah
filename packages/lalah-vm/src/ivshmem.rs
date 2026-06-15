@@ -6,6 +6,12 @@
 //! returned by `IOCTL_IVSHMEM_REQUEST_MMAP` is BAR2 offset 0, which equals the
 //! host memory-backend-file offset 0 — i.e. the [`shared::ShmHeader`].
 //!
+//! The device-interface GUID, the IOCTL codes, and the `IVSHMEM_MMAP` struct
+//! layout below are the public IVSHMEM driver interface defined by the Looking
+//! Glass project (GPL-2.0). They are reproduced here as interface facts solely
+//! to interoperate with the user-installed `ivshmem.sys` driver; no Looking
+//! Glass code is used.
+//!
 //! 64-bit only: the `IVSHMEM_MMAP` struct layout is x86_64-specific.
 
 use std::ffi::c_void;

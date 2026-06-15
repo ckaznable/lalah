@@ -5,6 +5,9 @@
 //! The API here mirrors the pipewire 0.10 `tone.rs` example (the only public
 //! shape that compiles against this version): `MainLoopRc` / `ContextRc` /
 //! `connect_rc` / `StreamBox` / `add_local_listener_with_user_data`.
+//!
+//! Adapted from the pipewire-rs `tone.rs` example, which is licensed MIT
+//! (Copyright The pipewire-rs Contributors).
 
 use pipewire as pw;
 use pw::spa::sys as spa_sys;
