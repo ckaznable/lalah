@@ -113,15 +113,6 @@ the device → *Advanced* → enable **"Allow applications to take exclusive con
 of this device"**. Otherwise `Initialize` fails with
 `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`.
 
-## Tested / not tested
+## License
 
-- ✅ `shared` ring buffer: 8 unit tests (layout, format gate, frame alignment,
-  wrap-around, bounded-latency drop, oversized push, attach validation).
-- ✅ Cross-mapping integration test: two independent `mmap`s of one file share
-  magic/format/payload through the contract.
-- ✅ `lalah-host` builds and runs on Linux (maps a real `/dev/shm` file, writes
-  the verified header layout, plays via PipeWire).
-- ✅ `lalah-vm` type-checks against the real `windows` 0.62 bindings
-  (`cargo check --target x86_64-pc-windows-gnu`). It has **not** been run on a
-  real Windows guest yet — the IVSHMEM ioctl codes, the WASAPI exclusive
-  init/alignment dance, and end-to-end audio still need on-target validation.
+MIT
