@@ -28,9 +28,16 @@ const REFTIMES_PER_SEC: f64 = 10_000_000.0;
 /// Wake-up timeout per capture cycle; treated as a stall if exceeded.
 const WAIT_TIMEOUT_MS: u32 = 2000;
 
-/// (rate, channels, bits, is_float) probe candidates for exclusive mode, best
-/// first. The first one the device accepts wins.
-const CANDIDATES: &[(u32, u16, u16, bool)] = &[
+// Plain WAVEFORMATEX format tags. Many capture cards (e.g. AVerMedia GC573)
+// accept ONLY the plain WAVEFORMATEX form in exclusive mode and reject
+// WAVEFORMATEXTENSIBLE for 16-bit stereo — so we probe plain PCM first. The
+// "Advanced" tab in mmsys.cpl shows exactly this plain format.
+const WAVE_FORMAT_PCM_TAG: u16 = 1;
+const WAVE_FORMAT_IEEE_FLOAT_TAG: u16 = 3;
+
+/// Base formats to probe, best first. Each is tried as plain WAVEFORMATEX first,
+/// then as WAVEFORMATEXTENSIBLE. The first the device accepts (S_OK) wins.
+const BASE_FORMATS: &[(u32, u16, u16, bool)] = &[
     (48_000, 2, 16, false),
     (44_100, 2, 16, false),
     (48_000, 1, 16, false),
@@ -38,24 +45,43 @@ const CANDIDATES: &[(u32, u16, u16, bool)] = &[
     (48_000, 2, 32, true),  // 32-bit IEEE float
 ];
 
-/// Build a WAVEFORMATEXTENSIBLE describing the candidate format.
-fn make_wfx(rate: u32, channels: u16, bits: u16, is_float: bool) -> WAVEFORMATEXTENSIBLE {
-    let block_align = channels * (bits / 8);
+#[derive(Clone, Copy)]
+struct Candidate {
+    rate: u32,
+    channels: u16,
+    bits: u16,
+    is_float: bool,
+    extensible: bool,
+}
+
+/// Build WAVEFORMATEXTENSIBLE storage configured either as a plain WAVEFORMATEX
+/// (`cbSize = 0`, PCM/FLOAT tag — the trailing fields are ignored) or a true
+/// WAVEFORMATEXTENSIBLE (`cbSize = 22`, SubFormat set). Using the larger struct
+/// as storage keeps the pointer correctly aligned for `Initialize`.
+fn make_wfx(c: Candidate) -> WAVEFORMATEXTENSIBLE {
+    let block_align = c.channels * (c.bits / 8);
+    let tag = if c.extensible {
+        WAVE_FORMAT_EXTENSIBLE as u16
+    } else if c.is_float {
+        WAVE_FORMAT_IEEE_FLOAT_TAG
+    } else {
+        WAVE_FORMAT_PCM_TAG
+    };
     WAVEFORMATEXTENSIBLE {
         Format: WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_EXTENSIBLE as u16,
-            nChannels: channels,
-            nSamplesPerSec: rate,
-            nAvgBytesPerSec: rate * block_align as u32,
+            wFormatTag: tag,
+            nChannels: c.channels,
+            nSamplesPerSec: c.rate,
+            nAvgBytesPerSec: c.rate * block_align as u32,
             nBlockAlign: block_align,
-            wBitsPerSample: bits,
-            cbSize: 22,
+            wBitsPerSample: c.bits,
+            cbSize: if c.extensible { 22 } else { 0 },
         },
         Samples: WAVEFORMATEXTENSIBLE_0 {
-            wValidBitsPerSample: bits,
+            wValidBitsPerSample: c.bits,
         },
-        dwChannelMask: 0,
-        SubFormat: if is_float {
+        dwChannelMask: if c.channels >= 2 { 0x3 } else { 0x4 },
+        SubFormat: if c.is_float {
             KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
         } else {
             KSDATAFORMAT_SUBTYPE_PCM
@@ -63,20 +89,43 @@ fn make_wfx(rate: u32, channels: u16, bits: u16, is_float: bool) -> WAVEFORMATEX
     }
 }
 
-fn audio_format(rate: u32, channels: u16, bits: u16, is_float: bool) -> AudioFormat {
+/// Parse the chosen format blob into our wire [`AudioFormat`]. Returns `None` for
+/// formats we don't carry (e.g. 24-bit). Reads packed fields BY VALUE only
+/// (taking a reference to a packed field is UB).
+fn parse_audio_format(w: &WAVEFORMATEXTENSIBLE) -> Option<AudioFormat> {
+    let tag = w.Format.wFormatTag;
+    let bits = w.Format.wBitsPerSample;
+    let channels = w.Format.nChannels;
+    let rate = w.Format.nSamplesPerSec;
+    let block = w.Format.nBlockAlign;
+    let is_float = if tag == WAVE_FORMAT_IEEE_FLOAT_TAG {
+        true
+    } else if tag == WAVE_FORMAT_PCM_TAG {
+        false
+    } else if tag == WAVE_FORMAT_EXTENSIBLE as u16 {
+        let sub = w.SubFormat; // copy out of the packed struct before comparing
+        sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+    } else {
+        return None;
+    };
     let format = if is_float {
+        if bits != 32 {
+            return None;
+        }
         SampleFormat::F32Le
     } else if bits == 16 {
         SampleFormat::S16Le
-    } else {
+    } else if bits == 32 {
         SampleFormat::S32Le
+    } else {
+        return None;
     };
-    AudioFormat {
+    Some(AudioFormat {
         sample_rate: rate,
         channels: channels as u32,
         format,
-        frame_bytes: (channels * (bits / 8)) as u32,
-    }
+        frame_bytes: block as u32,
+    })
 }
 
 /// Capture from `device_id` and push PCM into `ring`. Blocks until the stream
@@ -101,25 +150,48 @@ pub fn capture_exclusive(device_id: &str, ring: &mut ShmAudioBuffer) -> Result<(
         let mut min_period: i64 = 0;
         audio_client.GetDevicePeriod(None, Some(&mut min_period))?;
 
-        // STEP 6: probe for a supported exclusive format (accept only S_OK).
-        let mut chosen: Option<(WAVEFORMATEXTENSIBLE, u32, u16, u16, bool)> = None;
-        for &(rate, channels, bits, is_float) in CANDIDATES {
-            let wfx = make_wfx(rate, channels, bits, is_float);
-            let hr = audio_client.IsFormatSupported(
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                &raw const wfx.Format,
-                None,
-            );
-            if hr == S_OK {
-                chosen = Some((wfx, rate, channels, bits, is_float));
-                break;
+        // STEP 6: probe for a supported exclusive format. Each base format is
+        // tried as plain WAVEFORMATEX first, then WAVEFORMATEXTENSIBLE; only S_OK
+        // counts. Every probe is logged so a failing device shows its verdicts.
+        let mut chosen: Option<WAVEFORMATEXTENSIBLE> = None;
+        'probe: for &(rate, channels, bits, is_float) in BASE_FORMATS {
+            for extensible in [false, true] {
+                let c = Candidate {
+                    rate,
+                    channels,
+                    bits,
+                    is_float,
+                    extensible,
+                };
+                let wfx = make_wfx(c);
+                let hr = audio_client.IsFormatSupported(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    &raw const wfx.Format,
+                    None,
+                );
+                println!(
+                    "lalah-vm: probe {} Hz {} ch {} bit{} [{}] -> 0x{:08X}",
+                    rate,
+                    channels,
+                    bits,
+                    if is_float { " float" } else { "" },
+                    if extensible { "EXTENSIBLE" } else { "PCM" },
+                    hr.0 as u32,
+                );
+                if hr == S_OK {
+                    chosen = Some(wfx);
+                    break 'probe;
+                }
             }
         }
-        let (wfx, rate, channels, bits, is_float) = match chosen {
-            Some(c) => c,
+        let wfx = match chosen {
+            Some(w) => w,
             None => return Err(AUDCLNT_E_UNSUPPORTED_FORMAT.into()),
         };
-        let block_align = (channels * (bits / 8)) as usize;
+        let fmt = parse_audio_format(&wfx)
+            .ok_or_else(|| windows::core::Error::from(AUDCLNT_E_UNSUPPORTED_FORMAT))?;
+        let rate = fmt.sample_rate;
+        let block_align = fmt.frame_bytes as usize;
 
         // STEP 7-9: initialize, with the buffer-size alignment retry.
         let mut hns = min_period;
@@ -156,14 +228,10 @@ pub fn capture_exclusive(device_id: &str, ring: &mut ShmAudioBuffer) -> Result<(
 
         // Publish the negotiated format BEFORE Start so the host can configure
         // PipeWire and begin consuming.
-        ring.set_format(audio_format(rate, channels, bits, is_float));
+        ring.set_format(fmt);
         println!(
-            "lalah-vm: capturing exclusive {} Hz, {} ch, {} bit{} (block {} B).",
-            rate,
-            channels,
-            bits,
-            if is_float { " float" } else { "" },
-            block_align
+            "lalah-vm: capturing exclusive {} Hz, {} ch, {:?} (frame {} B).",
+            fmt.sample_rate, fmt.channels, fmt.format, fmt.frame_bytes
         );
 
         // STEP 12: go.

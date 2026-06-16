@@ -11,6 +11,8 @@
 #[cfg(windows)]
 mod ivshmem;
 #[cfg(windows)]
+mod video;
+#[cfg(windows)]
 mod wasapi;
 
 #[cfg(not(windows))]
@@ -26,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(windows)]
 mod windows_main {
-    use crate::{ivshmem, wasapi};
+    use crate::{ivshmem, video, wasapi};
     use shared::ShmAudioBuffer;
     use std::time::Duration;
 
@@ -36,25 +38,40 @@ mod windows_main {
 
     struct Args {
         device_id: String,
+        /// Keep a video capture stream open so the card emits audio (GC573 etc.).
+        video_keepalive: bool,
+        /// Optional friendly-name substring to pick the video device.
+        video_device: Option<String>,
     }
 
     fn usage() -> ! {
         eprintln!(
-            "Usage: lalah-vm [--device <endpoint-id>]\n\
+            "Usage: lalah-vm [--device <endpoint-id>] [--video-keepalive] [--video-device <name>]\n\
              \n\
              --device <endpoint-id>   WASAPI capture (input) endpoint id to grab\n\
+             --video-keepalive        open a video capture stream and discard frames so the\n\
+             \x20                        card starts its audio (needed for AVerMedia GC573 etc.)\n\
+             --video-device <name>    friendly-name substring to pick the video device\n\
+             \x20                        (implies --video-keepalive; default: first video device)\n\
              \n\
-             If omitted, the baked-in DEFAULT_DEVICE_ID is used."
+             If --device is omitted, the baked-in DEFAULT_DEVICE_ID is used."
         );
         std::process::exit(2);
     }
 
     fn parse_args() -> Args {
         let mut device_id = DEFAULT_DEVICE_ID.to_string();
+        let mut video_keepalive = false;
+        let mut video_device = None;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--device" => device_id = it.next().unwrap_or_else(|| usage()),
+                "--video-keepalive" => video_keepalive = true,
+                "--video-device" => {
+                    video_device = Some(it.next().unwrap_or_else(|| usage()));
+                    video_keepalive = true;
+                }
                 "-h" | "--help" => usage(),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -66,7 +83,11 @@ mod windows_main {
             eprintln!("error: no capture device id (pass --device or set DEFAULT_DEVICE_ID)");
             usage();
         }
-        Args { device_id }
+        Args {
+            device_id,
+            video_keepalive,
+            video_device,
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,6 +114,29 @@ mod windows_main {
             "lalah-vm: attached ring (capacity {} B). Opening capture device…",
             ring.capacity()
         );
+
+        // Capture cards (e.g. AVerMedia GC573) only emit audio while video is
+        // streaming. Keep the video pin alive (OBS-style) BEFORE probing audio so
+        // the audio endpoint reports its formats and produces frames. Held for the
+        // whole capture; dropped (stops the worker) when run() returns.
+        let _video = if args.video_keepalive {
+            match video::VideoKeepAlive::start(args.video_device.clone()) {
+                Ok(v) => {
+                    // Let the card spin up before the WASAPI format probe.
+                    std::thread::sleep(Duration::from_millis(700));
+                    Some(v)
+                }
+                Err(e) => {
+                    eprintln!("lalah-vm: video keep-alive failed: {e}");
+                    eprintln!(
+                        "lalah-vm: continuing without it (audio may not start on this device)."
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Run the WASAPI capture loop: it publishes the format then pushes PCM
         // into the ring until the stream stalls or errors.

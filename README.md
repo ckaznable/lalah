@@ -101,10 +101,21 @@ Start the **host first** (it initializes the header), then the guest producer:
 
 # Windows guest (capture/input endpoint id; no enumeration)
 lalah-vm.exe --device "{0.0.1.00000000}.{your-endpoint-guid}"
+
+# Capture card that needs video running for audio (AVerMedia GC573 etc.)
+lalah-vm.exe --device "{0.0.1.00000000}.{guid}" --video-device "Live Gamer"
 ```
 
 `lalah-vm` attach-retries until the host has initialized the region, publishes the
 negotiated format, then streams. `lalah-host` waits for that format, then plays.
+
+`lalah-vm` flags:
+
+- `--device <endpoint-id>` — the WASAPI capture (input) endpoint to grab.
+- `--video-keepalive` — open a video capture stream and discard its frames so the
+  card starts its audio pin (see below).
+- `--video-device <name>` — friendly-name substring to pick the video device
+  (implies `--video-keepalive`; default: the first video device).
 
 ### Windows prerequisite
 
@@ -112,6 +123,21 @@ The capture endpoint must allow exclusive control: in `mmsys.cpl` → Recording 
 the device → *Advanced* → enable **"Allow applications to take exclusive control
 of this device"**. Otherwise `Initialize` fails with
 `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`.
+
+### Capture cards (AVerMedia GC573, Elgato, …)
+
+Two device-specific behaviours are handled:
+
+1. **Exclusive format probing.** Many cards accept only the plain `WAVEFORMATEX`
+   form in exclusive mode and reject `WAVEFORMATEXTENSIBLE` for 16-bit stereo
+   (this is the format the *Advanced* tab shows, e.g. 48000/16/2). `lalah-vm`
+   probes plain `WAVEFORMATEX` first, then extensible, and logs every probe with
+   its `HRESULT` so you can see exactly what the device accepts.
+2. **Video-gated audio.** The card only emits audio while video is captured. Pass
+   `--video-keepalive` (or `--video-device <name>`): `lalah-vm` opens the video
+   source with Media Foundation and discards every frame (the OBS approach),
+   purely to keep the audio pin alive. This starts **before** the audio probe so
+   the endpoint is live by the time we open it.
 
 ## License
 
