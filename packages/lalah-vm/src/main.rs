@@ -42,17 +42,20 @@ mod windows_main {
         video_keepalive: bool,
         /// Optional friendly-name substring to pick the video device.
         video_device: Option<String>,
+        /// Video renderer: "null" (default, no window) or "window" (opens a window).
+        video_renderer: String,
     }
 
     fn usage() -> ! {
         eprintln!(
-            "Usage: lalah-vm [--device <endpoint-id>] [--video-keepalive] [--video-device <name>]\n\
+            "Usage: lalah-vm [--device <endpoint-id>] [--video-keepalive] [--video-device <name>] [--video-renderer <null|window>]\n\
              \n\
-             --device <endpoint-id>   WASAPI capture (input) endpoint id to grab\n\
-             --video-keepalive        open a video capture stream and discard frames so the\n\
-             \x20                        card starts its audio (needed for AVerMedia GC573 etc.)\n\
-             --video-device <name>    friendly-name substring to pick the video device\n\
-             \x20                        (implies --video-keepalive; default: first video device)\n\
+             --device <endpoint-id>         WASAPI capture (input) endpoint id to grab\n\
+             --video-keepalive              open a video capture stream and discard frames so the\n\
+             \x20                              card starts its audio (needed for AVerMedia GC573 etc.)\n\
+             --video-device <name>          friendly-name substring to pick the video device\n\
+             \x20                              (implies --video-keepalive; default: first video device)\n\
+             --video-renderer <null|window> video renderer to use (default: null)\n\
              \n\
              If --device is omitted, the baked-in DEFAULT_DEVICE_ID is used."
         );
@@ -63,6 +66,7 @@ mod windows_main {
         let mut device_id = DEFAULT_DEVICE_ID.to_string();
         let mut video_keepalive = false;
         let mut video_device = None;
+        let mut video_renderer = "null".to_string();
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -71,6 +75,14 @@ mod windows_main {
                 "--video-device" => {
                     video_device = Some(it.next().unwrap_or_else(|| usage()));
                     video_keepalive = true;
+                }
+                "--video-renderer" => {
+                    let val = it.next().unwrap_or_else(|| usage());
+                    if val != "null" && val != "window" {
+                        eprintln!("error: --video-renderer must be 'null' or 'window'");
+                        usage();
+                    }
+                    video_renderer = val;
                 }
                 "-h" | "--help" => usage(),
                 other => {
@@ -87,6 +99,7 @@ mod windows_main {
             device_id,
             video_keepalive,
             video_device,
+            video_renderer,
         }
     }
 
@@ -120,7 +133,8 @@ mod windows_main {
         // the audio endpoint reports its formats and produces frames. Held for the
         // whole capture; dropped (stops the worker) when run() returns.
         let _video = if args.video_keepalive {
-            match video::VideoKeepAlive::start(args.video_device.clone()) {
+            let use_null_renderer = args.video_renderer == "null";
+            match video::VideoKeepAlive::start(args.video_device.clone(), use_null_renderer) {
                 Ok(v) => {
                     // Let the card spin up before the WASAPI format probe.
                     std::thread::sleep(Duration::from_millis(700));
@@ -140,6 +154,7 @@ mod windows_main {
 
         // Run the WASAPI capture loop: it publishes the format then pushes PCM
         // into the ring until the stream stalls or errors.
+        std::thread::sleep(Duration::from_millis(3000));
         wasapi::capture_exclusive(&args.device_id, &mut ring)?;
         Ok(())
     }
