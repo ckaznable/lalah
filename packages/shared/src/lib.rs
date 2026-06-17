@@ -224,6 +224,13 @@ impl ShmAudioBuffer {
         self.cap
     }
 
+    /// Returns the current (head, tail) pointer values of the ring buffer.
+    #[inline]
+    pub fn pointers(&self) -> (u64, u64) {
+        let h = self.h();
+        (h.head.load(Ordering::Relaxed), h.tail.load(Ordering::Acquire))
+    }
+
     /// PRODUCER: publish the negotiated format ONCE, on WASAPI start.
     ///
     /// `frame_bytes` is published LAST (Release) — it is the consumer's

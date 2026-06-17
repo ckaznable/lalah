@@ -152,7 +152,9 @@ mod windows_main {
         // streaming. Keep the video pin alive (OBS-style) BEFORE probing audio so
         // the audio endpoint reports its formats and produces frames. Held for the
         // whole capture; dropped (stops the worker) when run() returns.
-        let _video = if args.video_keepalive {
+        // For DirectShow audio capture, we run video and audio in the same Filter Graph.
+        // For WASAPI capture, we run the keepalive in a separate thread.
+        let _video = if !args.ds_audio && args.video_keepalive {
             let use_null_renderer = args.video_renderer == "null";
             match video::VideoKeepAlive::start(args.video_device.clone(), use_null_renderer) {
                 Ok(v) => {
@@ -175,7 +177,18 @@ mod windows_main {
         if args.ds_audio {
             // DirectShow audio capture: publishes the format then forwards PCM
             // into the ring. Takes the ring by value and blocks until terminated.
-            dshow::capture_dshow_audio(args.audio_device.as_deref(), ring)?;
+            // Both audio capture and video keep-alive run in the same Filter Graph here.
+            let video_renderer_type = if args.video_keepalive {
+                Some(args.video_renderer.as_str())
+            } else {
+                None
+            };
+            dshow::capture_dshow_audio(
+                args.audio_device.as_deref(),
+                args.video_device.as_deref(),
+                video_renderer_type,
+                ring,
+            )?;
         } else {
             // WASAPI exclusive capture: publishes the format then pushes PCM into
             // the ring until the stream stalls or errors.

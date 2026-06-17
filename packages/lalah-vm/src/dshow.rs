@@ -25,10 +25,10 @@ use shared::{AudioFormat, SampleFormat, ShmAudioBuffer};
 // paths (hence the direct `windows-core` dep). `IUnknown_Vtbl` is referenced by
 // the generated vtable for an `: IUnknown` interface, so it must be in scope.
 use windows::core::{
-    implement, interface, Interface, Result, GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR,
+    implement, interface, Interface, Result, BOOL, GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR,
 };
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, S_OK};
-use windows::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
+use windows::Win32::Media::Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
 use windows::Win32::Media::MediaFoundation::{
     AM_MEDIA_TYPE, CLSID_AudioInputDeviceCategory, CLSID_CaptureGraphBuilder2, CLSID_FilterGraph,
     CLSID_SystemDeviceEnum, FORMAT_WaveFormatEx, MEDIASUBTYPE_PCM, MEDIATYPE_Audio,
@@ -48,6 +48,7 @@ use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR};
 // qedit CLSIDs / IIDs (not in windows-rs).
 const CLSID_SAMPLE_GRABBER: GUID = GUID::from_u128(0xc1f400a0_3f08_11d3_9f0b_006008039e37);
 const CLSID_NULL_RENDERER: GUID = GUID::from_u128(0xc1f400a4_3f08_11d3_9f0b_006008039e37);
+const CLSID_VIDEO_INPUT_DEVICE_CATEGORY: GUID = GUID::from_u128(0x860bb310_5d01_11d0_bd3b_00a0c911ce86);
 
 /// `ISampleGrabber` — the subset we call.
 #[interface("6b652fff-11fe-4fce-92ad-0266b5d7c78f")]
@@ -93,9 +94,16 @@ impl ISampleGrabberCB_Impl for GrabberCb_Impl {
 }
 
 /// Capture audio from a DirectShow audio device into `ring`. Blocks (the graph
-/// runs on its own threads) until the process is terminated. `device_name`, if
-/// given, selects the audio device whose friendly name contains it.
-pub fn capture_dshow_audio(device_name: Option<&str>, ring: ShmAudioBuffer) -> Result<()> {
+/// runs on its own threads) until the process is terminated. `audio_device`, if
+/// given, selects the audio device whose friendly name contains it. If
+/// `video_renderer_type` is Some, we also add and render the video device
+/// (`video_device`) in the same Filter Graph to keep the capture card active.
+pub fn capture_dshow_audio(
+    audio_device: Option<&str>,
+    video_device: Option<&str>,
+    video_renderer_type: Option<&str>,
+    ring: ShmAudioBuffer,
+) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
@@ -106,19 +114,46 @@ pub fn capture_dshow_audio(device_name: Option<&str>, ring: ShmAudioBuffer) -> R
         builder.SetFiltergraph(&graph)?;
         let control: IMediaControl = graph.cast()?;
 
-        // Source audio filter.
-        let source = find_audio_source(device_name)?;
-        graph.AddFilter(&source, PCWSTR::null())?;
+
+        // Optional source video filter.
+        let video_source_opt = if video_renderer_type.is_some() {
+            match find_video_source(video_device) {
+                Ok(video_source) => {
+                    graph.AddFilter(&video_source, PCWSTR::null())?;
+                    Some(video_source)
+                }
+                Err(e) => {
+                    eprintln!("lalah-vm(dshow): failed to find or add video device: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Sample grabber, asking for uncompressed PCM audio.
         let grabber_filter: IBaseFilter =
             CoCreateInstance(&CLSID_SAMPLE_GRABBER, None, CLSCTX_INPROC_SERVER)?;
         let grabber: ISampleGrabber = grabber_filter.cast()?;
-        let want = AM_MEDIA_TYPE {
-            majortype: MEDIATYPE_Audio,
-            subtype: MEDIASUBTYPE_PCM,
-            ..Default::default()
-        };
+
+        let mut wfx = WAVEFORMATEX::default();
+        wfx.wFormatTag = WAVE_FORMAT_PCM as u16;
+        wfx.nChannels = 2;
+        wfx.nSamplesPerSec = 48000;
+        wfx.wBitsPerSample = 16;
+        wfx.nBlockAlign = (wfx.nChannels * wfx.wBitsPerSample) / 8; // 4
+        wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign as u32; // 192000
+        wfx.cbSize = 0;
+
+        let mut want = AM_MEDIA_TYPE::default();
+        want.majortype = MEDIATYPE_Audio;
+        want.subtype = MEDIASUBTYPE_PCM;
+        want.formattype = FORMAT_WaveFormatEx;
+        want.bFixedSizeSamples = BOOL::from(true);
+        want.lSampleSize = wfx.nBlockAlign as u32;
+        want.cbFormat = std::mem::size_of::<WAVEFORMATEX>() as u32;
+        want.pbFormat = &mut wfx as *mut _ as *mut u8;
+
         grabber.SetMediaType(&want).ok()?;
         grabber.SetOneShot(0).ok()?;
         grabber.SetBufferSamples(0).ok()?;
@@ -130,13 +165,66 @@ pub fn capture_dshow_audio(device_name: Option<&str>, ring: ShmAudioBuffer) -> R
         graph.AddFilter(&null_renderer, PCWSTR::null())?;
 
         // Connect source -> grabber -> null for the audio capture pin.
-        builder.RenderStream(
-            Some(&PIN_CATEGORY_CAPTURE),
-            &MEDIATYPE_Audio,
-            &source,
-            &grabber_filter,
-            &null_renderer,
-        )?;
+        // 1. Try to route audio directly from the video source filter if available.
+        let mut audio_routed = false;
+        if let Some(video_source) = &video_source_opt {
+            println!("lalah-vm(dshow): attempting to route audio pin from the video capture device...");
+            let route_res = builder.RenderStream(
+                Some(&PIN_CATEGORY_CAPTURE),
+                &MEDIATYPE_Audio,
+                video_source,
+                &grabber_filter,
+                &null_renderer,
+            );
+            match route_res {
+                Ok(_) => {
+                    println!("lalah-vm(dshow): successfully routed audio directly from the video device.");
+                    audio_routed = true;
+                }
+                Err(e) => {
+                    eprintln!("lalah-vm(dshow): video device has no audio pin or routing failed: {e}");
+                }
+            }
+        }
+
+        // 2. Fallback: find dedicated audio source and render it.
+        if !audio_routed {
+            println!("lalah-vm(dshow): using separate audio capture device...");
+            let source = find_audio_source(audio_device)?;
+            graph.AddFilter(&source, PCWSTR::null())?;
+            builder.RenderStream(
+                Some(&PIN_CATEGORY_CAPTURE),
+                &MEDIATYPE_Audio,
+                &source,
+                &grabber_filter,
+                &null_renderer,
+            )?;
+            println!("lalah-vm(dshow): successfully routed audio from the dedicated audio device.");
+        }
+
+        // Optional: Render the video stream if a video source was added.
+        if let Some(video_source) = &video_source_opt {
+            let video_renderer = if let Some(r_type) = video_renderer_type {
+                if r_type == "null" {
+                    let video_null_renderer: IBaseFilter =
+                        CoCreateInstance(&CLSID_NULL_RENDERER, None, CLSCTX_INPROC_SERVER)?;
+                    graph.AddFilter(&video_null_renderer, PCWSTR::null())?;
+                    Some(video_null_renderer)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            builder.RenderStream(
+                Some(&PIN_CATEGORY_CAPTURE),
+                std::ptr::null(), // accept any media type
+                video_source,
+                None,
+                video_renderer.as_ref(),
+            )?;
+        }
 
         // Read the negotiated format from the connection.
         let mut connected = AM_MEDIA_TYPE::default();
@@ -196,6 +284,38 @@ fn find_audio_source(name_filter: Option<&str>) -> Result<IBaseFilter> {
             }
         }
         eprintln!("lalah-vm(dshow): no matching audio capture device. Seen: {seen:?}");
+        Err(windows::core::Error::from(E_FAIL))
+    }
+}
+
+/// Enumerate DirectShow video capture devices and bind the chosen one.
+fn find_video_source(name_filter: Option<&str>) -> Result<IBaseFilter> {
+    unsafe {
+        let dev_enum: ICreateDevEnum =
+            CoCreateInstance(&CLSID_SystemDeviceEnum, None, CLSCTX_INPROC_SERVER)?;
+        let mut monikers: Option<IEnumMoniker> = None;
+        dev_enum.CreateClassEnumerator(&CLSID_VIDEO_INPUT_DEVICE_CATEGORY, &mut monikers, 0)?;
+        let monikers = monikers.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+
+        let bind_ctx = CreateBindCtx(0)?;
+        let mut seen: Vec<String> = Vec::new();
+        loop {
+            let mut one: [Option<IMoniker>; 1] = [None];
+            if monikers.Next(&mut one, None) != S_OK {
+                break;
+            }
+            let Some(moniker) = one[0].take() else { break };
+            let name = moniker_name(&moniker, &bind_ctx).unwrap_or_default();
+            let is_match =
+                name_filter.is_none_or(|f| name.to_lowercase().contains(&f.to_lowercase()));
+            seen.push(name.clone());
+            if is_match {
+                let filter: IBaseFilter = moniker.BindToObject(&bind_ctx, None::<&IMoniker>)?;
+                println!("lalah-vm(dshow): using video device \"{name}\"");
+                return Ok(filter);
+            }
+        }
+        eprintln!("lalah-vm(dshow): no matching video capture device. Seen: {seen:?}");
         Err(windows::core::Error::from(E_FAIL))
     }
 }

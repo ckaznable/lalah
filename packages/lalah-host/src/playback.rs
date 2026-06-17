@@ -14,6 +14,7 @@ use pw::spa::sys as spa_sys;
 use pw::{properties::properties, spa};
 use shared::{AudioFormat, SampleFormat, ShmAudioBuffer};
 use spa::pod::Pod;
+use std::time::Duration;
 
 /// Map our wire format enum onto the SPA audio format.
 fn spa_format(fmt: SampleFormat) -> spa::param::audio::AudioFormat {
@@ -31,6 +32,8 @@ struct PlaybackState {
     ring: ShmAudioBuffer,
     max_latency_bytes: u64,
     stride: usize,
+    underflows: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    overflows: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Run the playback loop. Blocks until the process is terminated.
@@ -63,10 +66,37 @@ pub fn run_playback(
         },
     )?;
 
+    let underflows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let overflows = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let u_clone = underflows.clone();
+    let o_clone = overflows.clone();
+    std::thread::spawn(move || {
+        let mut last_u = 0;
+        let mut last_o = 0;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let curr_u = u_clone.load(std::sync::atomic::Ordering::Relaxed);
+            let curr_o = o_clone.load(std::sync::atomic::Ordering::Relaxed);
+            if curr_u != last_u || curr_o != last_o {
+                let diff_u = curr_u - last_u;
+                let diff_o = curr_o - last_o;
+                println!(
+                    "lalah-host(stats): [Last 1s] Underflows (Producer/VM slow): {}, Overflows (Consumer/Host slow): {}",
+                    diff_u, diff_o
+                );
+                last_u = curr_u;
+                last_o = curr_o;
+            }
+        }
+    });
+
     let state = PlaybackState {
         ring,
         max_latency_bytes,
         stride,
+        underflows,
+        overflows,
     };
 
     let _listener = stream
@@ -85,7 +115,18 @@ pub fn run_playback(
                 // emit the full window and the sink clock keeps ticking even when
                 // the producer is briefly starved (silence, never stale bytes).
                 let window = (slice.len() / stride) * stride;
-                let _live = st.ring.read_quantum(&mut slice[..window], st.max_latency_bytes);
+                let budget = window as u64 + st.max_latency_bytes;
+
+                let (head, tail) = st.ring.pointers();
+                let avail = if tail >= head { tail - head } else { 0 };
+                if avail > budget {
+                    st.overflows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                let live = st.ring.read_quantum(&mut slice[..window], budget);
+                if live < window {
+                    st.underflows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 window
             } else {
                 0
