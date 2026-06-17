@@ -9,6 +9,8 @@
 //! magic is valid, then publishes the negotiated format and starts capturing.
 
 #[cfg(windows)]
+mod dshow;
+#[cfg(windows)]
 mod ivshmem;
 #[cfg(windows)]
 mod video;
@@ -28,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(windows)]
 mod windows_main {
-    use crate::{ivshmem, video, wasapi};
+    use crate::{dshow, ivshmem, video, wasapi};
     use shared::ShmAudioBuffer;
     use std::time::Duration;
 
@@ -38,6 +40,11 @@ mod windows_main {
 
     struct Args {
         device_id: String,
+        /// Use DirectShow (not WASAPI) to capture audio — for capture cards whose
+        /// audio only flows through their DShow filter (GC573 etc.).
+        ds_audio: bool,
+        /// Optional friendly-name substring to pick the DShow audio device.
+        audio_device: Option<String>,
         /// Keep a video capture stream open so the card emits audio (GC573 etc.).
         video_keepalive: bool,
         /// Optional friendly-name substring to pick the video device.
@@ -51,6 +58,9 @@ mod windows_main {
             "Usage: lalah-vm [--device <endpoint-id>] [--video-keepalive] [--video-device <name>] [--video-renderer <null|window>]\n\
              \n\
              --device <endpoint-id>         WASAPI capture (input) endpoint id to grab\n\
+             --ds-audio                     capture audio via DirectShow instead of WASAPI (GC573)\n\
+             --audio-device <name>          friendly-name substring for the DShow audio device\n\
+             \x20                              (implies --ds-audio; default: first audio device)\n\
              --video-keepalive              open a video capture stream and discard frames so the\n\
              \x20                              card starts its audio (needed for AVerMedia GC573 etc.)\n\
              --video-device <name>          friendly-name substring to pick the video device\n\
@@ -64,6 +74,8 @@ mod windows_main {
 
     fn parse_args() -> Args {
         let mut device_id = DEFAULT_DEVICE_ID.to_string();
+        let mut ds_audio = false;
+        let mut audio_device = None;
         let mut video_keepalive = false;
         let mut video_device = None;
         let mut video_renderer = "null".to_string();
@@ -71,6 +83,11 @@ mod windows_main {
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--device" => device_id = it.next().unwrap_or_else(|| usage()),
+                "--ds-audio" => ds_audio = true,
+                "--audio-device" => {
+                    audio_device = Some(it.next().unwrap_or_else(|| usage()));
+                    ds_audio = true;
+                }
                 "--video-keepalive" => video_keepalive = true,
                 "--video-device" => {
                     video_device = Some(it.next().unwrap_or_else(|| usage()));
@@ -91,12 +108,15 @@ mod windows_main {
                 }
             }
         }
-        if device_id.is_empty() {
-            eprintln!("error: no capture device id (pass --device or set DEFAULT_DEVICE_ID)");
+        // WASAPI needs an endpoint id; the DShow path selects by name instead.
+        if !ds_audio && device_id.is_empty() {
+            eprintln!("error: no capture device id (pass --device, --ds-audio, or set DEFAULT_DEVICE_ID)");
             usage();
         }
         Args {
             device_id,
+            ds_audio,
+            audio_device,
             video_keepalive,
             video_device,
             video_renderer,
@@ -152,10 +172,16 @@ mod windows_main {
             None
         };
 
-        // Run the WASAPI capture loop: it publishes the format then pushes PCM
-        // into the ring until the stream stalls or errors.
-        std::thread::sleep(Duration::from_millis(3000));
-        wasapi::capture_exclusive(&args.device_id, &mut ring)?;
+        if args.ds_audio {
+            // DirectShow audio capture: publishes the format then forwards PCM
+            // into the ring. Takes the ring by value and blocks until terminated.
+            dshow::capture_dshow_audio(args.audio_device.as_deref(), ring)?;
+        } else {
+            // WASAPI exclusive capture: publishes the format then pushes PCM into
+            // the ring until the stream stalls or errors.
+            std::thread::sleep(Duration::from_millis(3000));
+            wasapi::capture_exclusive(&args.device_id, &mut ring)?;
+        }
         Ok(())
     }
 }

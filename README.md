@@ -104,6 +104,10 @@ lalah-vm.exe --device "{0.0.1.00000000}.{your-endpoint-guid}"
 
 # Capture card that needs video running for audio (AVerMedia GC573 etc.)
 lalah-vm.exe --device "{0.0.1.00000000}.{guid}" --video-device "Live Gamer"
+
+# Capture card whose audio only flows via DirectShow (GC573): grab audio via DShow.
+# Run once without --audio-device first to list the detected audio devices.
+lalah-vm.exe --ds-audio --audio-device "AVerMedia"
 ```
 
 `lalah-vm` attach-retries until the host has initialized the region, publishes the
@@ -112,6 +116,11 @@ negotiated format, then streams. `lalah-host` waits for that format, then plays.
 `lalah-vm` flags:
 
 - `--device <endpoint-id>` — the WASAPI capture (input) endpoint to grab.
+- `--ds-audio` — capture audio via **DirectShow** instead of WASAPI (for capture
+  cards whose audio only flows through their DShow filter). `--device` is then
+  ignored.
+- `--audio-device <name>` — friendly-name substring to pick the DShow audio device
+  (implies `--ds-audio`; default: the first audio device).
 - `--video-keepalive` — open a video capture stream and discard its frames so the
   card starts its audio pin (see below).
 - `--video-device <name>` — friendly-name substring to pick the video device
@@ -138,6 +147,14 @@ Two device-specific behaviours are handled:
    source with Media Foundation and discards every frame (the OBS approach),
    purely to keep the audio pin alive. This starts **before** the audio probe so
    the endpoint is live by the time we open it.
+3. **DirectShow audio fallback.** If the card's audio never appears via WASAPI
+   (the endpoint stays silent even with video running), grab it through DirectShow
+   instead: `--ds-audio` builds a `source → SampleGrabber → NullRenderer` graph
+   and forwards the grabbed PCM into the ring — the same way OBS pulls capture-card
+   audio. Opening the DShow graph also starts the card streaming, so
+   `--video-keepalive` is usually unnecessary alongside it. Run `--ds-audio` once
+   with no `--audio-device` to list the detected audio devices, then pass a name
+   substring.
 
 ## License
 

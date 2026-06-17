@@ -21,6 +21,10 @@ windows = { version = "0.62.2", features = [
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",
+    # windows-rs puts the shared DirectShow constants/structs (AM_MEDIA_TYPE,
+    # CLSID_FilterGraph, MEDIATYPE_Audio, …) in the MediaFoundation module, so the
+    # DShow capture path needs this feature even though we don't use MF itself.
+    "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
     "Win32_System_Threading",
     "Win32_Devices_DeviceAndDriverInstallation",
@@ -29,3 +33,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ioctl",
     "Win32_Security",
 ] }
+# Direct dep so the `#[interface]`/`#[implement]` macros (which expand to
+# `windows_core::` crate paths) resolve. Unifies with `windows`'s own copy.
+windows-core = "0.62"
