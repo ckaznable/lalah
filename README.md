@@ -3,9 +3,10 @@
 Bridges audio from a Windows 11 guest to a Linux host over an **IVSHMEM** shared
 memory region, with minimal latency.
 
-- **`lalah-vm`** (Windows guest, producer): grabs a *given* capture/input endpoint
-  with **WASAPI in exclusive, event-driven mode** and writes raw PCM frames into a
-  lock-free ring in the shared region.
+- **`lalah-vm`** (Windows guest, producer): captures audio — either a *given*
+  endpoint via **WASAPI exclusive, event-driven**, or a capture card's audio via
+  **DirectShow** (`--ds-audio`) — and writes raw PCM frames into a lock-free ring
+  in the shared region.
 - **`lalah-host`** (Linux host, consumer): `mmap`s the IVSHMEM
   memory-backend-file, reads the ring, and plays the bytes out through
   **PipeWire**, with bounded latency (drops the oldest audio if it falls behind).
@@ -14,7 +15,7 @@ memory region, with minimal latency.
 
 ```
  ┌─────────────── Windows 11 guest ───────────────┐      ┌──────────── Linux host ────────────┐
- │  capture endpoint ──WASAPI excl.──► lalah-vm    │      │   lalah-host ──► PipeWire ──► speakers│
+ │  capture endpoint ──WASAPI/DShow──► lalah-vm    │      │   lalah-host ──► PipeWire ──► speakers│
  │                                       │ push     │      │      ▲ read_quantum                  │
  │                              ivshmem.sys (BAR2)  │      │   mmap(/dev/shm/lalah)               │
  └───────────────────────────────────────┼────────┘      └──────┼──────────────────────────────┘
@@ -39,7 +40,7 @@ deliberately conservative:
 - **Producer seqlock + consumer post-copy recheck** eliminate torn reads / overrun.
 - **Format auto-negotiation**: the host initializes the header with the format
   *unset*; the VM publishes the negotiated `(rate, channels, sample-format)` once
-  on WASAPI start; the host waits for it before configuring PipeWire.
+  on capture start; the host waits for it before configuring PipeWire.
 - **All offsets are frame-aligned**, so a PCM sample is never split (no clicks).
 
 Sample formats carried: `S16LE`, `S32LE`, `F32LE` (little-endian both sides;
@@ -97,7 +98,7 @@ Start the **host first** (it initializes the header), then the guest producer:
 
 ```sh
 # Linux host
-./lalah-host --shm /dev/shm/lalah --latency-ms 20
+./lalah-host --shm /dev/shm/lalah --latency-ms 20 --quantum 256
 
 # Windows guest (capture/input endpoint id; no enumeration)
 lalah-vm.exe --device "{0.0.1.00000000}.{your-endpoint-guid}"
@@ -121,10 +122,30 @@ negotiated format, then streams. `lalah-host` waits for that format, then plays.
   ignored.
 - `--audio-device <name>` — friendly-name substring to pick the DShow audio device
   (implies `--ds-audio`; default: the first audio device).
-- `--video-keepalive` — open a video capture stream and discard its frames so the
-  card starts its audio pin (see below).
+- `--video-keepalive` — open a **DirectShow** video capture stream and discard its
+  frames so the card starts streaming its audio pin (see below).
 - `--video-device <name>` — friendly-name substring to pick the video device
   (implies `--video-keepalive`; default: the first video device).
+- `--video-renderer <null|window>` — renderer for the keep-alive: `null` (default,
+  no window) or `window` (shows a preview window; try it if a device refuses to
+  stream to a null renderer).
+
+`lalah-host` flags:
+
+- `--shm <path>` — memory-backend-file to mmap (default `/dev/shm/lalah`).
+- `--latency-ms <u32>` — jitter-buffer budget; the ring drops the oldest audio once
+  the backlog exceeds it (default 20).
+- `--quantum <frames>` — PipeWire quantum hint (`NODE_LATENCY = quantum/rate`);
+  lower = less latency, more wakeups (default 256; the server may clamp).
+
+### Tuning latency
+
+End-to-end latency ≈ capture buffer + ring jitter buffer (`--latency-ms`) + PipeWire
+quantum (`--quantum`) + sink buffer. The two knobs you control are `--latency-ms`
+and `--quantum`; lower each until the audio starts to break up, then back off.
+`lalah-host` prints a once-per-second line whenever it slips —
+`Underflows (Producer/VM slow)` / `Overflows (Consumer/Host slow)` — so watch that
+while tuning, and cross-check the actual quantum with `pw-top`.
 
 ### Windows prerequisite
 
@@ -144,9 +165,10 @@ Two device-specific behaviours are handled:
    its `HRESULT` so you can see exactly what the device accepts.
 2. **Video-gated audio.** The card only emits audio while video is captured. Pass
    `--video-keepalive` (or `--video-device <name>`): `lalah-vm` opens the video
-   source with Media Foundation and discards every frame (the OBS approach),
-   purely to keep the audio pin alive. This starts **before** the audio probe so
-   the endpoint is live by the time we open it.
+   source with **DirectShow** and discards every frame (the OBS approach), purely
+   to keep the audio pin alive. This starts **before** the audio probe so the
+   endpoint is live by the time we open it. Use `--video-renderer window` if a
+   device won't start streaming to a null renderer.
 3. **DirectShow audio fallback.** If the card's audio never appears via WASAPI
    (the endpoint stays silent even with video running), grab it through DirectShow
    instead: `--ds-audio` builds a `source → SampleGrabber → NullRenderer` graph
