@@ -44,6 +44,7 @@ pub fn run_playback(
     fmt: AudioFormat,
     ring: ShmAudioBuffer,
     max_latency_bytes: u64,
+    quantum: u32,
 ) -> Result<(), pw::Error> {
     pw::init();
 
@@ -52,8 +53,9 @@ pub fn run_playback(
     let core = context.connect_rc(None)?;
 
     let stride = fmt.frame_bytes as usize;
-    // Low-latency quantum hint; the server may clamp to its global min/max.
-    let latency = format!("256/{}", fmt.sample_rate);
+    // Quantum hint (frames/rate); lower = less latency. The server may clamp to
+    // its global min/max quantum.
+    let latency = format!("{}/{}", quantum, fmt.sample_rate);
 
     let stream = pw::stream::StreamBox::new(
         &core,
@@ -178,8 +180,8 @@ pub fn run_playback(
     )?;
 
     println!(
-        "lalah-host: playing {} Hz, {} ch, {:?} (frame {} B); latency budget {} B. Ctrl-C to stop.",
-        fmt.sample_rate, fmt.channels, fmt.format, fmt.frame_bytes, max_latency_bytes
+        "lalah-host: playing {} Hz, {} ch, {:?} (frame {} B); quantum {}/{}, latency budget {} B. Ctrl-C to stop.",
+        fmt.sample_rate, fmt.channels, fmt.format, fmt.frame_bytes, quantum, fmt.sample_rate, max_latency_bytes
     );
 
     mainloop.run();

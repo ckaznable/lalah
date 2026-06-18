@@ -31,19 +31,24 @@ mod linux {
 
     const DEFAULT_SHM: &str = "/dev/shm/lalah";
     const DEFAULT_LATENCY_MS: u32 = 20;
+    const DEFAULT_QUANTUM: u32 = 256;
     const PAGE: usize = 4096;
 
     struct Args {
         shm_path: String,
         latency_ms: u32,
+        /// PipeWire quantum in frames (NODE_LATENCY = quantum/rate).
+        quantum: u32,
     }
 
     fn usage() -> ! {
         eprintln!(
-            "Usage: lalah-host [--shm <path>] [--latency-ms <u32>]\n\
+            "Usage: lalah-host [--shm <path>] [--latency-ms <u32>] [--quantum <frames>]\n\
              \n\
              --shm <path>         memory-backend-file path (default {DEFAULT_SHM})\n\
-             --latency-ms <u32>   max buffered latency before dropping old audio (default {DEFAULT_LATENCY_MS})"
+             --latency-ms <u32>   max buffered latency before dropping old audio (default {DEFAULT_LATENCY_MS})\n\
+             --quantum <frames>   PipeWire quantum hint in frames; lower = less latency,\n\
+             \x20                    more wakeups (default {DEFAULT_QUANTUM}; server may clamp)"
         );
         std::process::exit(2);
     }
@@ -51,6 +56,7 @@ mod linux {
     fn parse_args() -> Args {
         let mut shm_path = DEFAULT_SHM.to_string();
         let mut latency_ms = DEFAULT_LATENCY_MS;
+        let mut quantum = DEFAULT_QUANTUM;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -59,6 +65,13 @@ mod linux {
                     latency_ms = it
                         .next()
                         .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage())
+                }
+                "--quantum" => {
+                    quantum = it
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|&q| q > 0)
                         .unwrap_or_else(|| usage())
                 }
                 "-h" | "--help" => usage(),
@@ -71,6 +84,7 @@ mod linux {
         Args {
             shm_path,
             latency_ms,
+            quantum,
         }
     }
 
@@ -135,7 +149,7 @@ mod linux {
 
         // `mmap` and `file` stay alive in this scope for the whole blocking run,
         // keeping the pointers inside `ring` valid.
-        playback::run_playback(fmt, ring, max_latency_bytes)?;
+        playback::run_playback(fmt, ring, max_latency_bytes, args.quantum)?;
 
         drop(mmap);
         drop(file);
