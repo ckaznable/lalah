@@ -26,6 +26,9 @@ windows = { version = "0.62.2", features = [
     # DShow capture path needs this feature even though we don't use MF itself.
     "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
+    # VIDEOINFOHEADER (video passthrough) embeds BITMAPINFOHEADER and is gated
+    # behind the Gdi feature in windows-rs.
+    "Win32_Graphics_Gdi",
     "Win32_System_Threading",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Storage_FileSystem",

@@ -13,6 +13,11 @@ memory region, with minimal latency.
 - **`shared`**: the *frozen* cross-process contract — the `ShmHeader` layout and
   the `ShmAudioBuffer` ring API. Both sides compile against it verbatim.
 
+There is also an **experimental video passthrough** (off by default): the VM grabs
+raw capture-card frames and writes them into a second sub-region of the same
+IVSHMEM mapping; the host forwards whole frames into a named pipe (FIFO) for mpv.
+See [Experimental: video passthrough](#experimental-video-passthrough).
+
 ```
  ┌─────────────── Windows 11 guest ───────────────┐      ┌──────────── Linux host ────────────┐
  │  capture endpoint ──WASAPI/DShow──► lalah-vm    │      │   lalah-host ──► PipeWire ──► speakers│
@@ -129,6 +134,10 @@ negotiated format, then streams. `lalah-host` waits for that format, then plays.
 - `--video-renderer <null|window>` — renderer for the keep-alive: `null` (default,
   no window) or `window` (shows a preview window; try it if a device refuses to
   stream to a null renderer).
+- `--video-passthrough` — **EXPERIMENTAL**: grab raw video frames via a DirectShow
+  SampleGrabber and forward them into the shared video region. Implies `--ds-audio`
+  (it rides the same Filter Graph). Use `--video-device <name>` to pick the card.
+  Requires the host to run with `--video-fifo`.
 
 `lalah-host` flags:
 
@@ -137,6 +146,12 @@ negotiated format, then streams. `lalah-host` waits for that format, then plays.
   the backlog exceeds it (default 20).
 - `--quantum <frames>` — PipeWire quantum hint (`NODE_LATENCY = quantum/rate`);
   lower = less latency, more wakeups (default 256; the server may clamp).
+- `--video-fifo <path>` — **EXPERIMENTAL**: enable video passthrough and forward
+  raw frames to this named pipe (created if absent). Pins audio to the first 16 MiB.
+- `--video-read-delay-us <us>` — stagger before reading a freshly published frame
+  (default 500; see below). Lower to 0 to disable the stagger.
+- `--video-pipe-size <bytes>` — desired FIFO buffer size (default 4 MiB; must hold
+  at least one whole frame — see the `fs.pipe-max-size` note below).
 
 ### Tuning latency
 
@@ -146,6 +161,79 @@ and `--quantum`; lower each until the audio starts to break up, then back off.
 `lalah-host` prints a once-per-second line whenever it slips —
 `Underflows (Producer/VM slow)` / `Overflows (Consumer/Host slow)` — so watch that
 while tuning, and cross-check the actual quantum with `pw-top`.
+
+## Experimental: video passthrough
+
+Off by default. When enabled, the **same** IVSHMEM mapping is split: audio is
+pinned to the first **16 MiB** (its ring becomes the largest power of two that
+fits there), and everything after 16 MiB is a self-describing video sub-region —
+its own magic/version header (the audio ABI is unchanged) followed by an N-slot
+frame ring.
+
+```
+ VM: card ─DShow SampleGrabber─► push_frame ─┐                ┌─► read_frame ─► FIFO ─► mpv
+                                             ▼                │   (O_NONBLOCK, drop if full)
+   IVSHMEM:  [0 .. 16 MiB) audio ring  │  [16 MiB .. end) ShmVideoHeader + frame slots
+```
+
+Enable it on **both** sides:
+
+```sh
+# Host: forward frames to a FIFO that mpv will read.
+./lalah-host --video-fifo /tmp/lalah-video
+
+# Guest (GC573 etc.): grab audio + video over DirectShow.
+lalah-vm.exe --video-passthrough --audio-device "AVerMedia" --video-device "Live Gamer"
+```
+
+On start the host prints the published geometry and a ready-to-run **mpv** command,
+e.g.:
+
+```sh
+mpv --demuxer=rawvideo --demuxer-rawvideo-w=1920 --demuxer-rawvideo-h=1080 \
+    --demuxer-rawvideo-mp-format=yuyv422 --untimed --profile=low-latency /tmp/lalah-video
+```
+
+Start mpv (or start it first — the host retries the FIFO open until a reader
+connects, in either order). Frames are passed through **raw and uncompressed**;
+the host derives the mpv pixel format from the card's FourCC (`YUY2`→`yuyv422`,
+`NV12`→`nv12`, `P010`→`p010`, …) and prints a `--demuxer-rawvideo-format=<FourCC>`
+fallback for anything it doesn't recognise.
+
+**Sizing the region.** You need `size = 16 MiB + (≥ 3 × frame_size)`. A 1080p
+`YUY2` frame is ~4 MiB, so allow ~32 MiB minimum; **64 MiB** is comfortable:
+
+```
+-object memory-backend-file,id=hostmem,mem-path=/dev/shm/lalah,size=67108864,share=on \
+-device ivshmem-plain,memdev=hostmem
+```
+
+If fewer than 3 frame slots fit past 16 MiB, the VM logs the rejection and runs
+audio-only.
+
+**Pipe buffer (important).** A whole frame must fit in the FIFO, so the host tries
+to set the pipe buffer to `--video-pipe-size` (default 4 MiB). The unprivileged
+cap is `fs.pipe-max-size` (1 MiB by default), so 4 MiB fails with `EPERM` and the
+host warns and falls back — at which point frames larger than the pipe are *all*
+dropped. Raise the cap once:
+
+```sh
+sudo sysctl -w fs.pipe-max-size=4194304   # or larger; or run lalah-host with CAP_SYS_RESOURCE
+```
+
+**No tearing, no blocking.** The producer writes slots round-robin and publishes a
+monotonic frame count; the consumer reads the newest slot and re-checks the count,
+dropping a frame only if the writer could have lapped it during the copy (with
+≥ 3 slots the two never share a slot in practice). The producer never waits on the
+consumer. `--video-read-delay-us` (default 500 µs) additionally staggers the host's
+read after a new frame is observed — measured on the host's own clock, so no
+guest/host clock comparison is needed — to keep the host's large copy off the same
+instant as the VM's write. It is a margin on top of the structural tear-safety, so
+you can lower it (even to 0) freely.
+
+**Behind on the consumer?** If mpv can't keep up, the pipe fills and the host drops
+whole frames (never partial), logging `dropped N frame(s)` periodically — video
+degrades to a lower frame rate without desyncing or stalling audio.
 
 ### Windows prerequisite
 

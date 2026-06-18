@@ -9,6 +9,8 @@
 
 #[cfg(target_os = "linux")]
 mod playback;
+#[cfg(target_os = "linux")]
+mod video;
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,15 +25,17 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use crate::playback;
+    use crate::{playback, video};
     use memmap2::MmapOptions;
-    use shared::{ShmAudioBuffer, ShmHeader};
+    use shared::{ShmAudioBuffer, ShmHeader, ShmVideoBuffer};
     use std::fs::OpenOptions;
     use std::time::Duration;
 
     const DEFAULT_SHM: &str = "/dev/shm/lalah";
     const DEFAULT_LATENCY_MS: u32 = 20;
     const DEFAULT_QUANTUM: u32 = 256;
+    const DEFAULT_VIDEO_READ_DELAY_US: u64 = 500;
+    const DEFAULT_VIDEO_PIPE_SIZE: usize = 4 * 1024 * 1024;
     const PAGE: usize = 4096;
 
     struct Args {
@@ -39,16 +43,29 @@ mod linux {
         latency_ms: u32,
         /// PipeWire quantum in frames (NODE_LATENCY = quantum/rate).
         quantum: u32,
+        /// Experimental video passthrough: FIFO to forward raw frames to (enables
+        /// video when set).
+        video_fifo: Option<String>,
+        /// Stagger before reading a freshly published frame (microseconds).
+        video_read_delay_us: u64,
+        /// Desired FIFO buffer size in bytes (must hold >= one frame).
+        video_pipe_size: usize,
     }
 
     fn usage() -> ! {
         eprintln!(
             "Usage: lalah-host [--shm <path>] [--latency-ms <u32>] [--quantum <frames>]\n\
+             \x20                 [--video-fifo <path>] [--video-read-delay-us <us>] [--video-pipe-size <bytes>]\n\
              \n\
-             --shm <path>         memory-backend-file path (default {DEFAULT_SHM})\n\
-             --latency-ms <u32>   max buffered latency before dropping old audio (default {DEFAULT_LATENCY_MS})\n\
-             --quantum <frames>   PipeWire quantum hint in frames; lower = less latency,\n\
-             \x20                    more wakeups (default {DEFAULT_QUANTUM}; server may clamp)"
+             --shm <path>                 memory-backend-file path (default {DEFAULT_SHM})\n\
+             --latency-ms <u32>           max buffered latency before dropping old audio (default {DEFAULT_LATENCY_MS})\n\
+             --quantum <frames>           PipeWire quantum hint in frames; lower = less latency,\n\
+             \x20                            more wakeups (default {DEFAULT_QUANTUM}; server may clamp)\n\
+             --video-fifo <path>          EXPERIMENTAL: forward raw video frames to this named pipe\n\
+             \x20                            (enables video; pins audio to the first 16 MiB)\n\
+             --video-read-delay-us <us>   stagger before reading a new frame (default {DEFAULT_VIDEO_READ_DELAY_US})\n\
+             --video-pipe-size <bytes>    desired FIFO buffer size (default {DEFAULT_VIDEO_PIPE_SIZE}; needs\n\
+             \x20                            fs.pipe-max-size raised for >1 MiB)"
         );
         std::process::exit(2);
     }
@@ -57,6 +74,9 @@ mod linux {
         let mut shm_path = DEFAULT_SHM.to_string();
         let mut latency_ms = DEFAULT_LATENCY_MS;
         let mut quantum = DEFAULT_QUANTUM;
+        let mut video_fifo = None;
+        let mut video_read_delay_us = DEFAULT_VIDEO_READ_DELAY_US;
+        let mut video_pipe_size = DEFAULT_VIDEO_PIPE_SIZE;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -74,6 +94,20 @@ mod linux {
                         .filter(|&q| q > 0)
                         .unwrap_or_else(|| usage())
                 }
+                "--video-fifo" => video_fifo = Some(it.next().unwrap_or_else(|| usage())),
+                "--video-read-delay-us" => {
+                    video_read_delay_us = it
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage())
+                }
+                "--video-pipe-size" => {
+                    video_pipe_size = it
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|&s| s > 0)
+                        .unwrap_or_else(|| usage())
+                }
                 "-h" | "--help" => usage(),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -85,6 +119,9 @@ mod linux {
             shm_path,
             latency_ms,
             quantum,
+            video_fifo,
+            video_read_delay_us,
+            video_pipe_size,
         }
     }
 
@@ -125,7 +162,21 @@ mod linux {
             off += PAGE;
         }
 
-        let cap = prev_power_of_two(total - header_size);
+        // With video enabled the audio ring is pinned to the first 16 MiB and the
+        // video sub-region takes everything after it; otherwise audio owns the
+        // whole mapping (byte-identical to a video-unaware build).
+        let cap = if args.video_fifo.is_some() {
+            if total <= shared::AUDIO_REGION_BYTES {
+                return Err(format!(
+                    "--video-fifo set but shm region {total} B <= audio region {} B; grow QEMU size=",
+                    shared::AUDIO_REGION_BYTES
+                )
+                .into());
+            }
+            prev_power_of_two(shared::AUDIO_REGION_BYTES - header_size)
+        } else {
+            prev_power_of_two(total - header_size)
+        };
         println!(
             "lalah-host: mapped {} ({} B), ring capacity {} B; initializing header.",
             args.shm_path, total, cap
@@ -133,6 +184,36 @@ mod linux {
 
         // Host is the initializer: publish magic/version/capacity, format UNSET.
         let ring = unsafe { ShmAudioBuffer::init(base, total, cap) };
+
+        // Experimental video passthrough: initialize the video sub-region and spawn
+        // a thread that forwards frames to the FIFO. It runs for the whole process;
+        // `mmap` stays alive (the audio playback below blocks forever), keeping the
+        // video pointers valid.
+        if let Some(fifo) = args.video_fifo.clone() {
+            match unsafe { shared::video_region(base, total) } {
+                Some((vbase, vlen)) => {
+                    let vid = unsafe { ShmVideoBuffer::init(vbase, vlen) };
+                    let delay = args.video_read_delay_us;
+                    let psize = args.video_pipe_size;
+                    println!(
+                        "lalah-host: video passthrough enabled (region {} B at +{} B, FIFO {}).",
+                        vlen,
+                        shared::AUDIO_REGION_BYTES,
+                        fifo
+                    );
+                    std::thread::Builder::new()
+                        .name("video-forward".into())
+                        .spawn(move || video::run_video(vid, fifo, psize, delay))?;
+                }
+                None => {
+                    return Err(format!(
+                        "--video-fifo set but shm region {total} B has no room past the {} B audio region; grow QEMU size=",
+                        shared::AUDIO_REGION_BYTES
+                    )
+                    .into());
+                }
+            }
+        }
 
         // Wait for the producer (VM) to negotiate + publish the format.
         let fmt = loop {

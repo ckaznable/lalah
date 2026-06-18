@@ -391,6 +391,367 @@ unsafe fn volatile_copy_from(base: *const u8, off: usize, dst: &mut [u8]) {
     }
 }
 
+// ======================= VIDEO (experimental passthrough) ====================
+//
+// Optional second sub-region for forwarding raw video frames VM -> host. It is
+// SELF-LOCATING and SELF-DESCRIBING: when video is enabled, audio is pinned to
+// the first [`AUDIO_REGION_BYTES`] of the mapping and the video region is
+// everything after it, beginning with its own [`ShmVideoHeader`] (its own magic /
+// version, independent of the audio header — enabling video does NOT change the
+// audio ABI). When video is disabled, none of this is touched and the audio
+// layout is byte-identical to a video-unaware build.
+//
+// Tearing is handled structurally, not by timing: the payload is an N-slot frame
+// ring. The producer writes slots round-robin and publishes a monotonic frame
+// count (Release); the consumer reads the newest slot and re-checks the count
+// (Acquire) — if the producer advanced by >= N-1 frames during the copy, the
+// slot may have been lapped, so the frame is reported torn and the consumer drops
+// it. With N >= 3 the writer and reader are never on the same slot in practice.
+// The producer NEVER reads consumer state (no backpressure) — same contract as
+// the audio ring.
+
+/// When video is enabled, audio occupies the first 16 MiB of the mapping and the
+/// video region is everything after it. Both sides agree on this split by this
+/// constant alone, so the video region needs no pointer stored in the audio
+/// header.
+pub const AUDIO_REGION_BYTES: usize = 16 * 1024 * 1024;
+
+/// Magic for the video sub-region header ("LALAHVD1"), independent of
+/// [`SHM_MAGIC`]. Published last by the host initializer.
+pub const VIDEO_MAGIC: u64 = 0x4C41_4C41_5648_4431;
+/// Video sub-region layout version. Bump on any change to [`ShmVideoHeader`].
+pub const VIDEO_VERSION: u32 = 1;
+/// Minimum frame slots for the tear-safe ring: the writer's slot, a one-slot
+/// separation margin, and the reader's slot.
+pub const VIDEO_MIN_SLOTS: u32 = 3;
+
+/// Snapshot of the published video geometry. `fourcc` is the DirectShow
+/// `biCompression` (e.g. `YUY2`); `frame_size` is `biSizeImage` (the slot size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoFormat {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per row (0 if the producer could not determine it).
+    pub stride: u32,
+    /// `biCompression` FourCC, or 0 for an RGB/uncompressed `BI_RGB` frame.
+    pub fourcc: u32,
+    /// Bytes per frame == the ring slot's used length (`biSizeImage`).
+    pub frame_size: u32,
+}
+
+/// FROZEN video header. `repr(C, align(64))`, total 128 = two 64-byte lines.
+///
+/// * Line 0: config (host init) + geometry (producer publishes once).
+/// * Line 1: producer-owned `frame_seq` (monotonic count of completed frames).
+///
+/// Frame slots follow at offset `size_of::<ShmVideoHeader>()` (already 64-aligned),
+/// each `align_up_64(frame_size)` bytes wide.
+#[repr(C, align(64))]
+pub struct ShmVideoHeader {
+    // ---- line 0: config + geometry ----
+    /// [`VIDEO_MAGIC`]; published last (Release), validated first (Acquire).
+    magic: AtomicU64, // off 0
+    /// [`VIDEO_VERSION`].
+    version: AtomicU32, // off 8
+    /// `size_of::<ShmVideoHeader>()` == 128; ABI guard.
+    header_size: AtomicU32, // off 12
+    width: AtomicU32,   // off 16
+    height: AtomicU32,  // off 20
+    stride: AtomicU32,  // off 24
+    fourcc: AtomicU32,  // off 28
+    /// Bytes per frame; `0` is the "geometry not yet published" gate.
+    frame_size: AtomicU32, // off 32
+    /// Number of frame slots (computed by the producer at publish time).
+    slot_count: AtomicU32, // off 36
+    _vpad0: [u8; 24], // off 40 -> 64
+    // ---- line 1: producer-owned ----
+    /// Monotonic count of completed frames; slot of frame `f` is `f % slot_count`.
+    frame_seq: AtomicU64, // off 64
+    _vpad1: [u8; 56], // off 72 -> 128
+}
+
+const _: () = assert!(core::mem::size_of::<ShmVideoHeader>() == 128);
+const _: () = assert!(core::mem::align_of::<ShmVideoHeader>() == 64);
+
+/// Round `n` up to a multiple of 64 (so every slot starts 64-byte aligned and the
+/// word-wise volatile copies below stay aligned).
+#[inline]
+const fn align_up_64(n: usize) -> usize {
+    (n + 63) & !63
+}
+
+/// Given the whole mapping, return the video sub-region `(base, len)` — the bytes
+/// after [`AUDIO_REGION_BYTES`] — or `None` if the mapping does not extend past
+/// the audio region.
+///
+/// # Safety
+/// `base` must point at a mapping of at least `total` bytes.
+pub unsafe fn video_region(base: *mut u8, total: usize) -> Option<(*mut u8, usize)> {
+    if total <= AUDIO_REGION_BYTES + core::mem::size_of::<ShmVideoHeader>() {
+        return None;
+    }
+    Some((unsafe { base.add(AUDIO_REGION_BYTES) }, total - AUDIO_REGION_BYTES))
+}
+
+/// Cross-process handle to the video sub-region. Like [`ShmAudioBuffer`], holds
+/// RAW POINTERS only and is `Send` but not `Sync` (one thread per side).
+pub struct ShmVideoBuffer {
+    hdr: *const ShmVideoHeader,
+    payload: *mut u8,
+    region_len: usize,
+    // Cached geometry (0 until published / refreshed). Both sides derive
+    // `slot_stride` from `frame_size` identically, so the modulo math matches.
+    frame_size: usize,
+    slot_stride: usize,
+    slot_count: usize,
+}
+
+unsafe impl Send for ShmVideoBuffer {}
+
+impl ShmVideoBuffer {
+    /// HOST INIT. Publish magic/version with the geometry UNSET; the producer
+    /// publishes the real geometry later via [`set_geometry`](Self::set_geometry).
+    ///
+    /// # Safety
+    /// `base` must point at a writable mapping of at least `region_len` bytes that
+    /// stays valid for the handle's lifetime, and no producer may be attached yet.
+    pub unsafe fn init(base: *mut u8, region_len: usize) -> Self {
+        let hs = core::mem::size_of::<ShmVideoHeader>();
+        assert!(region_len > hs, "video region too small for header");
+        let h = unsafe { &*(base as *const ShmVideoHeader) };
+        h.header_size.store(hs as u32, Ordering::Relaxed);
+        h.width.store(0, Ordering::Relaxed);
+        h.height.store(0, Ordering::Relaxed);
+        h.stride.store(0, Ordering::Relaxed);
+        h.fourcc.store(0, Ordering::Relaxed);
+        h.slot_count.store(0, Ordering::Relaxed);
+        h.frame_seq.store(0, Ordering::Relaxed);
+        h.frame_size.store(0, Ordering::Relaxed); // gate: geometry unset
+        h.version.store(VIDEO_VERSION, Ordering::Relaxed);
+        h.magic.store(VIDEO_MAGIC, Ordering::Release); // publish LAST
+        Self {
+            hdr: base as *const ShmVideoHeader,
+            payload: unsafe { base.add(hs) },
+            region_len,
+            frame_size: 0,
+            slot_stride: 0,
+            slot_count: 0,
+        }
+    }
+
+    /// ATTACH (producer). Validates magic/version/header_size; the geometry may
+    /// still be unset (the producer is the one who publishes it).
+    ///
+    /// # Safety
+    /// Same mapping requirements as [`init`](Self::init); the region must already
+    /// have been initialized by the host.
+    pub unsafe fn attach(base: *mut u8, region_len: usize) -> Result<Self, &'static str> {
+        let hs = core::mem::size_of::<ShmVideoHeader>();
+        if region_len <= hs {
+            return Err("video region smaller than header");
+        }
+        let h = unsafe { &*(base as *const ShmVideoHeader) };
+        if h.magic.load(Ordering::Acquire) != VIDEO_MAGIC {
+            return Err("bad video magic (region not initialized yet)");
+        }
+        if h.version.load(Ordering::Relaxed) != VIDEO_VERSION {
+            return Err("video version mismatch");
+        }
+        if h.header_size.load(Ordering::Relaxed) as usize != hs {
+            return Err("video ABI/header_size mismatch");
+        }
+        let mut me = Self {
+            hdr: base as *const ShmVideoHeader,
+            payload: unsafe { base.add(hs) },
+            region_len,
+            frame_size: 0,
+            slot_stride: 0,
+            slot_count: 0,
+        };
+        me.refresh_geometry();
+        Ok(me)
+    }
+
+    #[inline]
+    fn h(&self) -> &ShmVideoHeader {
+        unsafe { &*self.hdr }
+    }
+
+    /// PRODUCER: publish the geometry ONCE, on capture start. Computes and stores
+    /// the slot count for the actual region size; errors if fewer than
+    /// [`VIDEO_MIN_SLOTS`] frames fit. `frame_size` is published LAST (Release) —
+    /// the consumer's readiness gate.
+    pub fn set_geometry(&mut self, vf: VideoFormat) -> Result<u32, &'static str> {
+        if vf.frame_size == 0 {
+            return Err("zero frame_size");
+        }
+        let hs = core::mem::size_of::<ShmVideoHeader>();
+        let slot_stride = align_up_64(vf.frame_size as usize);
+        let usable = self.region_len - hs;
+        let slot_count = usable / slot_stride;
+        if (slot_count as u32) < VIDEO_MIN_SLOTS {
+            return Err("video region too small for >= 3 frame slots");
+        }
+        let slot_count = slot_count as u32;
+        self.frame_size = vf.frame_size as usize;
+        self.slot_stride = slot_stride;
+        self.slot_count = slot_count as usize;
+
+        let h = self.h();
+        h.width.store(vf.width, Ordering::Relaxed);
+        h.height.store(vf.height, Ordering::Relaxed);
+        h.stride.store(vf.stride, Ordering::Relaxed);
+        h.fourcc.store(vf.fourcc, Ordering::Relaxed);
+        h.slot_count.store(slot_count, Ordering::Relaxed);
+        h.frame_seq.store(0, Ordering::Relaxed); // fresh stream
+        h.frame_size.store(vf.frame_size, Ordering::Release); // gate, LAST
+        Ok(slot_count)
+    }
+
+    /// CONSUMER/PRODUCER: read the published geometry into the handle's cache and
+    /// return it, or `None` if the producer has not published yet
+    /// (`frame_size == 0`).
+    pub fn refresh_geometry(&mut self) -> Option<VideoFormat> {
+        // Read everything out first so the immutable header borrow ends before we
+        // update the cached fields.
+        let (fs, slot_count, width, height, stride, fourcc) = {
+            let h = self.h();
+            let fs = h.frame_size.load(Ordering::Acquire); // gate, first
+            if fs == 0 {
+                return None;
+            }
+            (
+                fs,
+                h.slot_count.load(Ordering::Relaxed) as usize,
+                h.width.load(Ordering::Relaxed),
+                h.height.load(Ordering::Relaxed),
+                h.stride.load(Ordering::Relaxed),
+                h.fourcc.load(Ordering::Relaxed),
+            )
+        };
+        self.frame_size = fs as usize;
+        self.slot_stride = align_up_64(fs as usize);
+        self.slot_count = slot_count;
+        Some(VideoFormat {
+            width,
+            height,
+            stride,
+            fourcc,
+            frame_size: fs,
+        })
+    }
+
+    /// Monotonic count of completed frames (Acquire). Used by the consumer to
+    /// detect a freshly published frame before applying its read stagger.
+    #[inline]
+    pub fn frame_count(&self) -> u64 {
+        self.h().frame_seq.load(Ordering::Acquire)
+    }
+
+    /// PRODUCER. Write one frame into the next ring slot and publish it. Copies at
+    /// most `frame_size` bytes (zero-filling a short source); a longer source is
+    /// truncated. NEVER blocks and never reads consumer state.
+    pub fn push_frame(&mut self, src: &[u8]) {
+        if self.frame_size == 0 || self.slot_count == 0 {
+            return;
+        }
+        let h = self.h();
+        let seq = h.frame_seq.load(Ordering::Relaxed);
+        let slot = (seq % self.slot_count as u64) as usize;
+        let off = slot * self.slot_stride;
+        unsafe {
+            volatile_write_frame(self.payload, off, src, self.frame_size);
+        }
+        // Publish: ensure the slot writes are visible before the count bump.
+        fence(Ordering::Release);
+        h.frame_seq.store(seq.wrapping_add(1), Ordering::Release);
+    }
+
+    /// CONSUMER. Copy the NEWEST published frame into `out` (which must be at least
+    /// `frame_size` bytes). Returns `Some(frame_number)` on a tear-safe read, or
+    /// `None` if no frame exists yet or the writer may have lapped the slot during
+    /// the copy (the caller drops a torn frame).
+    pub fn read_frame(&self, out: &mut [u8]) -> Option<u64> {
+        if self.frame_size == 0 || self.slot_count == 0 {
+            return None;
+        }
+        let h = self.h();
+        let s0 = h.frame_seq.load(Ordering::Acquire);
+        if s0 == 0 {
+            return None; // no frame published yet
+        }
+        let newest = s0 - 1;
+        let slot = (newest % self.slot_count as u64) as usize;
+        let off = slot * self.slot_stride;
+        let len = self.frame_size.min(out.len());
+        unsafe {
+            volatile_copy_from_words(self.payload, off, &mut out[..len]);
+        }
+        // Tear-safe iff the writer advanced < slot_count-1 frames during the copy,
+        // i.e. it cannot have started rewriting our slot.
+        let s1 = h.frame_seq.load(Ordering::Acquire);
+        if s1.wrapping_sub(s0) <= (self.slot_count as u64).saturating_sub(2) {
+            Some(newest)
+        } else {
+            None // possibly torn -> drop
+        }
+    }
+
+    /// Cached frame size in bytes (0 until geometry is known).
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.frame_size
+    }
+}
+
+/// Write exactly `frame_size` bytes into a frame slot with word-wise volatile
+/// stores (8 bytes/op + byte tail), sourcing bytes from `src` and zero-filling
+/// any remainder past `src.len()`. Faster than the per-byte audio copy, which
+/// matters for multi-MB frames. The whole pass is anchored at the 64-aligned slot
+/// base `base + off` (slots are `align_up_64`), so every `*mut u64` store is
+/// aligned regardless of how short `src` is.
+#[inline]
+unsafe fn volatile_write_frame(base: *mut u8, off: usize, src: &[u8], frame_size: usize) {
+    let dst = unsafe { base.add(off) };
+    let n = src.len().min(frame_size);
+    let words = frame_size / 8;
+    let mut i = 0;
+    while i < words {
+        let start = i * 8;
+        let mut b = [0u8; 8];
+        if start < n {
+            let avail = (n - start).min(8);
+            b[..avail].copy_from_slice(&src[start..start + avail]);
+        }
+        unsafe { core::ptr::write_volatile(dst.add(start) as *mut u64, u64::from_ne_bytes(b)) };
+        i += 1;
+    }
+    let mut j = words * 8;
+    while j < frame_size {
+        let byte = if j < n { src[j] } else { 0 };
+        unsafe { core::ptr::write_volatile(dst.add(j), byte) };
+        j += 1;
+    }
+}
+
+/// Word-wise volatile copy out of the payload. See [`volatile_write_frame`].
+#[inline]
+unsafe fn volatile_copy_from_words(base: *const u8, off: usize, dst: &mut [u8]) {
+    let s = unsafe { base.add(off) };
+    let words = dst.len() / 8;
+    let mut i = 0;
+    while i < words {
+        let w = unsafe { core::ptr::read_volatile(s.add(i * 8) as *const u64) };
+        dst[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
+        i += 1;
+    }
+    let mut j = words * 8;
+    while j < dst.len() {
+        dst[j] = unsafe { core::ptr::read_volatile(s.add(j)) };
+        j += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +890,130 @@ mod tests {
         let n = buf.read_quantum(&mut out, (4 * CAP) as u64);
         assert_eq!(n, CAP);
         assert_eq!(&out[..], &data[CAP..]);
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    const FRAME: usize = 64; // slot_stride == 64 (already 64-aligned)
+    const SLOTS: usize = 4;
+    const VLEN: usize = core::mem::size_of::<ShmVideoHeader>() + FRAME * SLOTS;
+
+    #[repr(C, align(64))]
+    struct VRegion([u8; VLEN]);
+
+    fn fresh() -> (Box<VRegion>, ShmVideoBuffer) {
+        let mut region = Box::new(VRegion([0u8; VLEN]));
+        let ptr = region.0.as_mut_ptr();
+        let buf = unsafe { ShmVideoBuffer::init(ptr, VLEN) };
+        (region, buf)
+    }
+
+    fn vfmt() -> VideoFormat {
+        VideoFormat {
+            width: 8,
+            height: 8,
+            stride: 8,
+            fourcc: u32::from_le_bytes(*b"YUY2"),
+            frame_size: FRAME as u32,
+        }
+    }
+
+    #[test]
+    fn video_header_layout_is_frozen() {
+        assert_eq!(core::mem::size_of::<ShmVideoHeader>(), 128);
+        assert_eq!(core::mem::align_of::<ShmVideoHeader>(), 64);
+    }
+
+    #[test]
+    fn geometry_gate_unset_until_published() {
+        let (_r, mut buf) = fresh();
+        assert!(buf.refresh_geometry().is_none(), "geometry must start unset");
+        let n = buf.set_geometry(vfmt()).expect("publish geometry");
+        assert_eq!(n, SLOTS as u32);
+        let vf = buf.refresh_geometry().expect("geometry published");
+        assert_eq!(vf, vfmt());
+    }
+
+    #[test]
+    fn attach_validates_video_magic() {
+        let (mut r, _buf) = fresh();
+        let ptr = r.0.as_mut_ptr();
+        assert!(unsafe { ShmVideoBuffer::attach(ptr, VLEN) }.is_ok());
+
+        let mut bad = Box::new(VRegion([0u8; VLEN]));
+        assert!(unsafe { ShmVideoBuffer::attach(bad.0.as_mut_ptr(), VLEN) }.is_err());
+    }
+
+    #[test]
+    fn region_too_small_for_three_slots_is_rejected() {
+        // Only room for 2 slots -> set_geometry must refuse.
+        const SMALL: usize = core::mem::size_of::<ShmVideoHeader>() + FRAME * 2;
+        #[repr(C, align(64))]
+        struct Small([u8; SMALL]);
+        let mut region = Box::new(Small([0u8; SMALL]));
+        let mut buf = unsafe { ShmVideoBuffer::init(region.0.as_mut_ptr(), SMALL) };
+        assert!(buf.set_geometry(vfmt()).is_err());
+    }
+
+    #[test]
+    fn no_frame_before_push() {
+        let (_r, mut buf) = fresh();
+        buf.set_geometry(vfmt()).unwrap();
+        let mut out = [0u8; FRAME];
+        assert!(buf.read_frame(&mut out).is_none());
+    }
+
+    #[test]
+    fn push_read_roundtrip_and_newest_wins() {
+        let (_r, mut buf) = fresh();
+        buf.set_geometry(vfmt()).unwrap();
+
+        let f1: Vec<u8> = (0..FRAME).map(|i| i as u8).collect();
+        buf.push_frame(&f1);
+        let mut out = [0u8; FRAME];
+        assert_eq!(buf.read_frame(&mut out), Some(0));
+        assert_eq!(&out[..], &f1[..]);
+
+        // Newest frame wins; older ones are skipped.
+        for k in 1..=5u8 {
+            let f: Vec<u8> = (0..FRAME).map(|i| i as u8 ^ (k * 17)).collect();
+            buf.push_frame(&f);
+        }
+        let n = buf.read_frame(&mut out).expect("frame");
+        assert_eq!(n, 5);
+        let expect: Vec<u8> = (0..FRAME).map(|i| i as u8 ^ (5 * 17)).collect();
+        assert_eq!(&out[..], &expect[..]);
+    }
+
+    #[test]
+    fn short_source_is_zero_filled() {
+        let (_r, mut buf) = fresh();
+        buf.set_geometry(vfmt()).unwrap();
+        buf.push_frame(&[0xAB; 10]); // shorter than FRAME
+        let mut out = [0xFFu8; FRAME];
+        assert_eq!(buf.read_frame(&mut out), Some(0));
+        assert_eq!(&out[..10], &[0xAB; 10]);
+        assert!(out[10..].iter().all(|&b| b == 0), "tail must be zero-filled");
+    }
+
+    #[test]
+    fn slot_wraps_around_ring() {
+        let (_r, mut buf) = fresh();
+        buf.set_geometry(vfmt()).unwrap(); // SLOTS slots
+        // Push more than SLOTS frames so the ring wraps; the newest must still
+        // round-trip cleanly.
+        for k in 0..(SLOTS as u8 * 3 + 1) {
+            let f: Vec<u8> = (0..FRAME).map(|i| (i as u8).wrapping_add(k)).collect();
+            buf.push_frame(&f);
+        }
+        let last = SLOTS as u8 * 3; // last k pushed
+        let mut out = [0u8; FRAME];
+        let n = buf.read_frame(&mut out).expect("frame");
+        assert_eq!(n, (SLOTS as u64 * 3 + 1) - 1);
+        let expect: Vec<u8> = (0..FRAME).map(|i| (i as u8).wrapping_add(last)).collect();
+        assert_eq!(&out[..], &expect[..]);
     }
 }

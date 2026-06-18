@@ -15,12 +15,15 @@
 
 // COM interface methods must match the vtable names (PascalCase).
 #![allow(non_snake_case)]
+// AM_MEDIA_TYPE has no ergonomic struct literal (many COM fields), so the
+// Default::default() + field-assignment pattern is how we build media types.
+#![allow(clippy::field_reassign_with_default)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use shared::{AudioFormat, SampleFormat, ShmAudioBuffer};
+use shared::{AudioFormat, SampleFormat, ShmAudioBuffer, ShmVideoBuffer, VideoFormat};
 // The `#[interface]`/`#[implement]` macros expand to `windows_core::` crate
 // paths (hence the direct `windows-core` dep). `IUnknown_Vtbl` is referenced by
 // the generated vtable for an `: IUnknown` interface, so it must be in scope.
@@ -31,8 +34,8 @@ use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, S_OK};
 use windows::Win32::Media::Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
 use windows::Win32::Media::MediaFoundation::{
     AM_MEDIA_TYPE, CLSID_AudioInputDeviceCategory, CLSID_CaptureGraphBuilder2, CLSID_FilterGraph,
-    CLSID_SystemDeviceEnum, FORMAT_WaveFormatEx, MEDIASUBTYPE_PCM, MEDIATYPE_Audio,
-    PIN_CATEGORY_CAPTURE,
+    CLSID_SystemDeviceEnum, FORMAT_VideoInfo, FORMAT_WaveFormatEx, MEDIASUBTYPE_PCM, MEDIATYPE_Audio,
+    MEDIATYPE_Video, PIN_CATEGORY_CAPTURE, VIDEOINFOHEADER,
 };
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::Media::DirectShow::{
@@ -93,15 +96,44 @@ impl ISampleGrabberCB_Impl for GrabberCb_Impl {
     }
 }
 
+/// Video variant: pushes each grabbed raw frame into the shared video ring. Same
+/// threading model as [`GrabberCb`] — DShow calls `BufferCB` on one streaming
+/// thread, so the `Mutex` is uncontended.
+#[implement(ISampleGrabberCB)]
+struct VideoGrabberCb {
+    vid: Mutex<ShmVideoBuffer>,
+}
+
+impl ISampleGrabberCB_Impl for VideoGrabberCb_Impl {
+    unsafe fn SampleCB(&self, _time: f64, _sample: *mut c_void) -> HRESULT {
+        E_NOTIMPL
+    }
+
+    unsafe fn BufferCB(&self, _time: f64, buffer: *mut u8, len: i32) -> HRESULT {
+        if !buffer.is_null() && len > 0 {
+            let slice = unsafe { std::slice::from_raw_parts(buffer, len as usize) };
+            if let Ok(mut vid) = self.vid.lock() {
+                vid.push_frame(slice);
+            }
+        }
+        S_OK
+    }
+}
+
 /// Capture audio from a DirectShow audio device into `ring`. Blocks (the graph
 /// runs on its own threads) until the process is terminated. `audio_device`, if
-/// given, selects the audio device whose friendly name contains it. If
-/// `video_renderer_type` is Some, we also add and render the video device
-/// (`video_device`) in the same Filter Graph to keep the capture card active.
+/// given, selects the audio device whose friendly name contains it.
+///
+/// A video device is opened in the SAME Filter Graph when either:
+///  * `video_ring` is `Some` — EXPERIMENTAL passthrough: a video SampleGrabber
+///    forwards raw frames into the shared video region; or
+///  * `video_renderer_type` is `Some` (keep-alive only): the video is rendered to
+///    a null/window renderer and discarded, purely to keep the card streaming.
 pub fn capture_dshow_audio(
     audio_device: Option<&str>,
     video_device: Option<&str>,
     video_renderer_type: Option<&str>,
+    video_ring: Option<ShmVideoBuffer>,
     ring: ShmAudioBuffer,
 ) -> Result<()> {
     unsafe {
@@ -114,9 +146,9 @@ pub fn capture_dshow_audio(
         builder.SetFiltergraph(&graph)?;
         let control: IMediaControl = graph.cast()?;
 
-
-        // Optional source video filter.
-        let video_source_opt = if video_renderer_type.is_some() {
+        // A video source is needed for passthrough OR keep-alive.
+        let want_video = video_renderer_type.is_some() || video_ring.is_some();
+        let video_source_opt = if want_video {
             match find_video_source(video_device) {
                 Ok(video_source) => {
                     graph.AddFilter(&video_source, PCWSTR::null())?;
@@ -202,28 +234,92 @@ pub fn capture_dshow_audio(
             println!("lalah-vm(dshow): successfully routed audio from the dedicated audio device.");
         }
 
-        // Optional: Render the video stream if a video source was added.
+        // Optional: video. Held to the end of the function so the SampleGrabber's
+        // un-AddRef'd callback pointer stays valid while the graph runs.
+        let mut _video_cb: Option<ISampleGrabberCB> = None;
+        if video_ring.is_some() && video_source_opt.is_none() {
+            eprintln!(
+                "lalah-vm(dshow): video passthrough requested but no video device was found; continuing audio-only."
+            );
+        }
         if let Some(video_source) = &video_source_opt {
-            let video_renderer = if let Some(r_type) = video_renderer_type {
-                if r_type == "null" {
+            if let Some(mut vid) = video_ring {
+                // EXPERIMENTAL passthrough: source -> video SampleGrabber -> null,
+                // grabbed frames forwarded into the shared video ring.
+                let vgf: IBaseFilter =
+                    CoCreateInstance(&CLSID_SAMPLE_GRABBER, None, CLSCTX_INPROC_SERVER)?;
+                let vgrab: ISampleGrabber = vgf.cast()?;
+                // Restrict to video only; leave subtype/format as wildcards so the
+                // card's native pixel format connects without inserting a converter.
+                let mut vwant = AM_MEDIA_TYPE::default();
+                vwant.majortype = MEDIATYPE_Video;
+                vgrab.SetMediaType(&vwant).ok()?;
+                vgrab.SetOneShot(0).ok()?;
+                vgrab.SetBufferSamples(0).ok()?;
+                graph.AddFilter(&vgf, PCWSTR::null())?;
+
+                let vnull: IBaseFilter =
+                    CoCreateInstance(&CLSID_NULL_RENDERER, None, CLSCTX_INPROC_SERVER)?;
+                graph.AddFilter(&vnull, PCWSTR::null())?;
+
+                builder.RenderStream(
+                    Some(&PIN_CATEGORY_CAPTURE),
+                    &MEDIATYPE_Video,
+                    video_source,
+                    &vgf,
+                    &vnull,
+                )?;
+
+                let mut vconn = AM_MEDIA_TYPE::default();
+                vgrab.GetConnectedMediaType(&mut vconn).ok()?;
+                let vf = parse_video_format(&vconn)
+                    .ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+                free_media_type(&mut vconn);
+
+                match vid.set_geometry(vf) {
+                    Ok(slots) => {
+                        println!(
+                            "lalah-vm(dshow): video {}x{} fourcc {} ({} B/frame), {} ring slots.",
+                            vf.width,
+                            vf.height,
+                            fourcc_str(vf.fourcc),
+                            vf.frame_size,
+                            slots
+                        );
+                        let vcb: ISampleGrabberCB = VideoGrabberCb {
+                            vid: Mutex::new(vid),
+                        }
+                        .into();
+                        vgrab.SetCallback(vcb.as_raw(), 1).ok()?; // 1 = BufferCB
+                        _video_cb = Some(vcb);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "lalah-vm(dshow): video geometry rejected ({e}); the IVSHMEM region \
+                             is too small for >= 3 frame slots past 16 MiB. Continuing audio-only."
+                        );
+                    }
+                }
+            } else if let Some(r_type) = video_renderer_type {
+                // Keep-alive only: render video to null (no window) or the default
+                // renderer (a window), discarding frames.
+                let video_renderer = if r_type == "null" {
                     let video_null_renderer: IBaseFilter =
                         CoCreateInstance(&CLSID_NULL_RENDERER, None, CLSCTX_INPROC_SERVER)?;
                     graph.AddFilter(&video_null_renderer, PCWSTR::null())?;
                     Some(video_null_renderer)
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
-            builder.RenderStream(
-                Some(&PIN_CATEGORY_CAPTURE),
-                std::ptr::null(), // accept any media type
-                video_source,
-                None,
-                video_renderer.as_ref(),
-            )?;
+                builder.RenderStream(
+                    Some(&PIN_CATEGORY_CAPTURE),
+                    std::ptr::null(), // accept any media type
+                    video_source,
+                    None,
+                    video_renderer.as_ref(),
+                )?;
+            }
         }
 
         // Read the negotiated format from the connection.
@@ -245,7 +341,11 @@ pub fn capture_dshow_audio(
         grabber.SetCallback(cb.as_raw(), 1).ok()?; // 1 = BufferCB
 
         control.Run()?;
-        println!("lalah-vm(dshow): graph running; forwarding audio. Ctrl-C to stop.");
+        if _video_cb.is_some() {
+            println!("lalah-vm(dshow): graph running; forwarding audio + video. Ctrl-C to stop.");
+        } else {
+            println!("lalah-vm(dshow): graph running; forwarding audio. Ctrl-C to stop.");
+        }
 
         // Keep every COM object (incl. the callback) alive while the graph runs.
         loop {
@@ -393,6 +493,55 @@ fn parse_wfx(mt: &AM_MEDIA_TYPE) -> Option<AudioFormat> {
         format,
         frame_bytes: block as u32,
     })
+}
+
+/// Parse the connected video `AM_MEDIA_TYPE` (a `VIDEOINFOHEADER`) into our wire
+/// geometry. Returns `None` for a non-`FORMAT_VideoInfo` or degenerate type.
+fn parse_video_format(mt: &AM_MEDIA_TYPE) -> Option<VideoFormat> {
+    if mt.formattype != FORMAT_VideoInfo
+        || mt.pbFormat.is_null()
+        || (mt.cbFormat as usize) < core::mem::size_of::<VIDEOINFOHEADER>()
+    {
+        return None;
+    }
+    // pbFormat may be unaligned, so read the whole struct out by value.
+    let vih = unsafe { core::ptr::read_unaligned(mt.pbFormat as *const VIDEOINFOHEADER) };
+    let bih = vih.bmiHeader;
+    let width = bih.biWidth.unsigned_abs();
+    let height = bih.biHeight.unsigned_abs(); // negative => top-down DIB
+    let fourcc = bih.biCompression;
+    let mut frame_size = bih.biSizeImage;
+    if frame_size == 0 {
+        // Some sources omit biSizeImage; derive it from the geometry.
+        frame_size = width
+            .saturating_mul(height)
+            .saturating_mul(bih.biBitCount as u32)
+            / 8;
+    }
+    if width == 0 || height == 0 || frame_size == 0 {
+        return None;
+    }
+    let stride = frame_size / height;
+    Some(VideoFormat {
+        width,
+        height,
+        stride,
+        fourcc,
+        frame_size,
+    })
+}
+
+/// Render a FourCC as its 4 ASCII chars (or `0x…` when not printable), for logs.
+fn fourcc_str(fourcc: u32) -> String {
+    if fourcc == 0 {
+        return "RGB".to_string();
+    }
+    let b = fourcc.to_le_bytes();
+    if b.iter().all(|&c| c.is_ascii_graphic() || c == b' ') {
+        String::from_utf8_lossy(&b).trim_end().to_string()
+    } else {
+        format!("0x{fourcc:08X}")
+    }
 }
 
 /// Free the format block + any embedded object of an `AM_MEDIA_TYPE` we own.

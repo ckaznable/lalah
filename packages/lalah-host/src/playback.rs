@@ -120,7 +120,7 @@ pub fn run_playback(
                 let budget = window as u64 + st.max_latency_bytes;
 
                 let (head, tail) = st.ring.pointers();
-                let avail = if tail >= head { tail - head } else { 0 };
+                let avail = tail.saturating_sub(head);
                 if avail > budget {
                     st.overflows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }

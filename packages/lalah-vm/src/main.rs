@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 mod windows_main {
     use crate::{dshow, ivshmem, video, wasapi};
-    use shared::ShmAudioBuffer;
+    use shared::{ShmAudioBuffer, ShmVideoBuffer};
     use std::time::Duration;
 
     /// Capture endpoint id to use when `--device` is not passed. Fill this in with
@@ -51,6 +51,9 @@ mod windows_main {
         video_device: Option<String>,
         /// Video renderer: "null" (default, no window) or "window" (opens a window).
         video_renderer: String,
+        /// EXPERIMENTAL: grab raw video frames via DirectShow and forward them into
+        /// the shared video region (implies --ds-audio; rides the same graph).
+        video_passthrough: bool,
     }
 
     fn usage() -> ! {
@@ -66,6 +69,8 @@ mod windows_main {
              --video-device <name>          friendly-name substring to pick the video device\n\
              \x20                              (implies --video-keepalive; default: first video device)\n\
              --video-renderer <null|window> video renderer to use (default: null)\n\
+             --video-passthrough            EXPERIMENTAL: grab raw video frames and forward them into\n\
+             \x20                              the shared video region (implies --ds-audio)\n\
              \n\
              If --device is omitted, the baked-in DEFAULT_DEVICE_ID is used."
         );
@@ -79,6 +84,7 @@ mod windows_main {
         let mut video_keepalive = false;
         let mut video_device = None;
         let mut video_renderer = "null".to_string();
+        let mut video_passthrough = false;
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -101,6 +107,11 @@ mod windows_main {
                     }
                     video_renderer = val;
                 }
+                "--video-passthrough" => {
+                    video_passthrough = true;
+                    // Passthrough rides the DirectShow graph alongside DShow audio.
+                    ds_audio = true;
+                }
                 "-h" | "--help" => usage(),
                 other => {
                     eprintln!("unknown argument: {other}");
@@ -120,6 +131,7 @@ mod windows_main {
             video_keepalive,
             video_device,
             video_renderer,
+            video_passthrough,
         }
     }
 
@@ -174,10 +186,46 @@ mod windows_main {
             None
         };
 
+        // EXPERIMENTAL video passthrough: attach the shared video sub-region (the
+        // host initializes it). Retry until the host is up. Held by value and moved
+        // into the DShow graph, which publishes geometry and forwards frames.
+        let video_ring = if args.video_passthrough {
+            match unsafe { shared::video_region(region.base, region.len) } {
+                Some((vbase, vlen)) => {
+                    println!(
+                        "lalah-vm: video passthrough on; attaching video region ({vlen} B)…"
+                    );
+                    let v = loop {
+                        match unsafe { ShmVideoBuffer::attach(vbase, vlen) } {
+                            Ok(v) => break v,
+                            Err(e) => {
+                                println!(
+                                    "lalah-vm: waiting for host to initialize the video region ({e})…"
+                                );
+                                std::thread::sleep(Duration::from_millis(500));
+                            }
+                        }
+                    };
+                    Some(v)
+                }
+                None => {
+                    eprintln!(
+                        "lalah-vm: --video-passthrough set but IVSHMEM region ({} B) has no room \
+                         past 16 MiB; video disabled.",
+                        region.len
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         if args.ds_audio {
             // DirectShow audio capture: publishes the format then forwards PCM
             // into the ring. Takes the ring by value and blocks until terminated.
-            // Both audio capture and video keep-alive run in the same Filter Graph here.
+            // Both audio capture and video (keep-alive or passthrough) run in the
+            // same Filter Graph here.
             let video_renderer_type = if args.video_keepalive {
                 Some(args.video_renderer.as_str())
             } else {
@@ -187,6 +235,7 @@ mod windows_main {
                 args.audio_device.as_deref(),
                 args.video_device.as_deref(),
                 video_renderer_type,
+                video_ring,
                 ring,
             )?;
         } else {
