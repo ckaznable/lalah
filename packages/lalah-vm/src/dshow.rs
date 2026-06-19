@@ -34,8 +34,8 @@ use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, S_OK};
 use windows::Win32::Media::Audio::{WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
 use windows::Win32::Media::MediaFoundation::{
     AM_MEDIA_TYPE, CLSID_AudioInputDeviceCategory, CLSID_CaptureGraphBuilder2, CLSID_FilterGraph,
-    CLSID_SystemDeviceEnum, FORMAT_VideoInfo, FORMAT_WaveFormatEx, MEDIASUBTYPE_PCM, MEDIATYPE_Audio,
-    MEDIATYPE_Video, PIN_CATEGORY_CAPTURE, VIDEOINFOHEADER,
+    CLSID_SystemDeviceEnum, FORMAT_VideoInfo, FORMAT_WaveFormatEx, MEDIASUBTYPE_NV12,
+    MEDIASUBTYPE_PCM, MEDIATYPE_Audio, MEDIATYPE_Video, PIN_CATEGORY_CAPTURE, VIDEOINFOHEADER,
 };
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::Media::DirectShow::{
@@ -249,10 +249,11 @@ pub fn capture_dshow_audio(
                 let vgf: IBaseFilter =
                     CoCreateInstance(&CLSID_SAMPLE_GRABBER, None, CLSCTX_INPROC_SERVER)?;
                 let vgrab: ISampleGrabber = vgf.cast()?;
-                // Restrict to video only; leave subtype/format as wildcards so the
-                // card's native pixel format connects without inserting a converter.
+                // Prefer NV12; the Sample Grabber will accept NV12 if the source
+                // offers it, otherwise a converter is inserted.
                 let mut vwant = AM_MEDIA_TYPE::default();
                 vwant.majortype = MEDIATYPE_Video;
+                vwant.subtype = MEDIASUBTYPE_NV12;
                 vgrab.SetMediaType(&vwant).ok()?;
                 vgrab.SetOneShot(0).ok()?;
                 vgrab.SetBufferSamples(0).ok()?;

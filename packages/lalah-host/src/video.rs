@@ -73,7 +73,7 @@ pub fn run_video(mut vid: ShmVideoBuffer, fifo_path: String, pipe_size: usize, r
                         warned_small_pipe = true;
                     }
                 }
-                None => {
+                _ => {
                     // No reader yet — don't accumulate stale frames meanwhile.
                     last_count = vid.frame_count();
                     std::thread::sleep(Duration::from_millis(100));
@@ -229,10 +229,10 @@ fn mpv_command(vf: &shared::VideoFormat, fifo: &str) -> String {
     );
     let fmt = match mpv_mp_format(vf.fourcc) {
         Some(name) => format!("--demuxer-rawvideo-mp-format={name}"),
-        None => format!(
+        _ => format!(
             "--demuxer-rawvideo-format={} # adjust if mpv rejects it",
             fourcc_string(vf.fourcc)
         ),
     };
-    format!("{base} {fmt} --untimed --profile=low-latency {fifo}")
+    format!("{base} {fmt} --demuxer-rawvideo-fps=60 --profile=low-latency {fifo}")
 }
